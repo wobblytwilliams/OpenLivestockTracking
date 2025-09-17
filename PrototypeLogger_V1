@@ -37,19 +37,22 @@ struct LogEvent;
 #endif
 
 // ---------------- SD (SdFs/FsFile) ----------------
+// We DO NOT keep files open; they are opened only inside a flush "session".
 const uint8_t SD_CS_PIN = 10;
 SdFs sd;
 SdSpiConfig sdCfg(SD_CS_PIN, DEDICATED_SPI, SD_SCK_MHZ(12));
-FsFile accelFile, gpsFile, bleFile;
+FsFile accelFile, gpsFile, bleFile;     // used only during a session
 const char* ACCEL_FILE = "/ACCEL.CSV";
 const char* GPS_FILE   = "/GPS.CSV";
 const char* BLE_FILE   = "/BLE.CSV";
+
+bool sdOK       = false;   // last mount result
+bool sdBusAwake = false;   // SPI bus active state
 
 // ---------------- USB MSC -------------------------
 Adafruit_USBD_MSC usb_msc;
 volatile bool mscReady = false;     // host can read/write when true
 bool mscMode  = false;              // user-controlled mode
-bool sdOK     = false;
 
 // ---------------- Rates & policy ------------------
 #define USB_BAUD              115200
@@ -347,12 +350,10 @@ bool adxl_init(){
   i2cWrite8(ADXL_ADDR, 0x38, (0b10<<6) | (wm & 0x1F));  // FIFO_CTL: STREAM + watermark
 
 #if ACCEL_USE_FIFO_INT
-  // Enable WATERMARK on INT1 (active high, push-pull default)
   i2cWrite8(ADXL_ADDR, 0x2E, 0x02);   // INT_ENABLE: WATERMARK
   i2cWrite8(ADXL_ADDR, 0x2F, 0x00);   // INT_MAP: WATERMARK -> INT1
 #else
-  // Polling mode: no interrupts
-  i2cWrite8(ADXL_ADDR, 0x2E, 0x00);   // INT_ENABLE: none
+  i2cWrite8(ADXL_ADDR, 0x2E, 0x00);   // INT_ENABLE: none   <-- fixed
 #endif
 
   (void)i2cRead8(ADXL_ADDR, 0x30);    // Clear any latched INT_SOURCE
@@ -494,6 +495,59 @@ void stopBleScan() {
 }
 
 // ====================================================================
+// SD bus helpers + session open/close
+// ====================================================================
+static inline void sd_spi_bus_wake(){
+  if (sdBusAwake) return;
+  pinMode(SD_CS_PIN, OUTPUT);
+  digitalWrite(SD_CS_PIN, HIGH);  // de-select card
+  SPI.begin();
+  delayMicroseconds(5);
+  sdBusAwake = true;
+}
+
+static inline void sd_spi_bus_sleep(){
+  if (!sdBusAwake) return;
+  digitalWrite(SD_CS_PIN, HIGH);
+  pinMode(SD_CS_PIN, INPUT_PULLUP);   // ensure de-selected
+  SPI.end();
+  pinMode(MOSI, INPUT);
+  pinMode(SCK,  INPUT);
+  pinMode(MISO, INPUT_PULLUP);
+  sdBusAwake = false;
+}
+
+static bool sd_session_begin(){
+  if (mscMode) return false;      // logging paused during MSC
+  sd_spi_bus_wake();
+  if (!sd.begin(sdCfg)) {
+    sdOK = false;
+    sd_spi_bus_sleep();
+    return false;
+  }
+  sdOK = true;
+
+  accelFile = sd.open(ACCEL_FILE, O_RDWR | O_CREAT | O_AT_END);
+  gpsFile   = sd.open(GPS_FILE,   O_RDWR | O_CREAT | O_AT_END);
+  bleFile   = sd.open(BLE_FILE,   O_RDWR | O_CREAT | O_AT_END);
+
+  if (accelFile && accelFile.fileSize()==0) accelFile.println("t_ms,unix_s,ax,ay,az");
+  if (gpsFile   && gpsFile.fileSize()==0)   gpsFile.println("t_ms,unix_s,lat,lon,fix,sync");
+  if (bleFile   && bleFile.fileSize()==0)   bleFile.println("t_ms,unix_s,mac,rssi");
+
+  return (bool)accelFile || (bool)gpsFile || (bool)bleFile;
+}
+
+static void sd_session_end(){
+  if (accelFile) { accelFile.flush(); accelFile.close(); }
+  if (gpsFile)   { gpsFile.flush();   gpsFile.close(); }
+  if (bleFile)   { bleFile.flush();   bleFile.close(); }
+
+  // Only sleep the bus if MSC is not active.
+  if (!mscMode) sd_spi_bus_sleep();
+}
+
+// ====================================================================
 // SD flush timing + helpers
 // ====================================================================
 bool     gpsSessionActive = false;
@@ -511,9 +565,11 @@ bool inQuietMode(){
 }
 
 void flushBuffers(bool emergency, uint8_t reason_code){
-  if(!sdOK) return;
-  if(!emergency && inQuietMode()) return;
+  // When mscMode is active we don’t log (except the pre-MSC flush call).
+  if (mscMode && reason_code != FR_MSC) return;
+  if (!emergency && inQuietMode()) return;
 
+  if (!sd_session_begin()) return;
 
   size_t n_acc = 0, n_gps = 0, n_ble = 0;
   static size_t acc_total = 0, gps_total = 0, ble_total = 0;
@@ -566,9 +622,7 @@ void flushBuffers(bool emergency, uint8_t reason_code){
     }
   }
 
-  if (accelFile) accelFile.flush();
-  if (gpsFile)   gpsFile.flush();
-  if (bleFile)   bleFile.flush();
+  sd_session_end();
 
   g_event_count = 0;
   lastFlushMs   = millis();
@@ -636,13 +690,14 @@ void setMSC(bool on){
   if (on) {
     Serial.println("MSC ON: stopping logging, flushing & closing files…");
     stopBleScan();
-    flushBuffers(true, FR_MSC);
-    if (accelFile) accelFile.close();
-    if (gpsFile)   gpsFile.close();
-    if (bleFile)   bleFile.close();
+    flushBuffers(true, FR_MSC);      // writes + closes + leaves bus asleep
 
+    // Now bring bus up, mount SD for MSC access and keep it awake
+    sd_spi_bus_wake();
+    sdOK = sd.begin(sdCfg);
     if (!sdOK || !sd.card()){
       Serial.println("MSC ON: SD not initialized/absent.");
+      sd_spi_bus_sleep();
       return;
     }
     uint32_t bc = sd.card()->sectorCount();
@@ -661,15 +716,12 @@ void setMSC(bool on){
     delay(10);
     TinyUSBDevice.detach(); delay(300); TinyUSBDevice.attach();
 
-    Serial.println("MSC OFF: reopening files & resuming logging.");
-    accelFile = sd.open(ACCEL_FILE, O_RDWR | O_CREAT | O_AT_END);
-    gpsFile   = sd.open(GPS_FILE,   O_RDWR | O_CREAT | O_AT_END);
-    bleFile   = sd.open(BLE_FILE,   O_RDWR | O_CREAT | O_AT_END);
-    if (accelFile && accelFile.fileSize()==0) accelFile.println("t_ms,unix_s,ax,ay,az");
-    if (gpsFile   && gpsFile.fileSize()==0)   gpsFile.println("t_ms,unix_s,lat,lon,fix,sync");
-    if (bleFile   && bleFile.fileSize()==0)   bleFile.println("t_ms,unix_s,mac,rssi");
     mscMode = false;
 
+    // After MSC, put the SPI bus back to sleep
+    sd_spi_bus_sleep();
+
+    Serial.println("MSC OFF: resuming logging.");
     lastBleCycleStartMs = millis() - BLE_CYCLE_PERIOD_MS;
     lastGpsSampleMs     = millis() - GPS_SAMPLE_PERIOD_MS;
   }
@@ -816,27 +868,11 @@ void setup(){
   attachInterrupt(digitalPinToInterrupt(ACCEL_INT_PIN), accel_isr, RISING);
 #endif
 
-  // --- SD first ---
-  Serial.print("Init SD @ 12 MHz… ");
-  sdOK = sd.begin(sdCfg);
-  if(!sdOK){
-    Serial.println("FAIL (MSC can still be enabled after SD works)");
-  } else {
-    Serial.println("OK");
-    accelFile = sd.open(ACCEL_FILE, O_RDWR | O_CREAT | O_AT_END);
-    gpsFile   = sd.open(GPS_FILE,   O_RDWR | O_CREAT | O_AT_END);
-    bleFile   = sd.open(BLE_FILE,   O_RDWR | O_CREAT | O_AT_END);
-    if(accelFile && accelFile.fileSize()==0) accelFile.println("t_ms,unix_s,ax,ay,az");
-    if(gpsFile   && gpsFile.fileSize()==0)   gpsFile.println("t_ms,unix_s,lat,lon,fix,sync");
-    if(bleFile   && bleFile.fileSize()==0)   bleFile.println("t_ms,unix_s,mac,rssi");
-  }
+  // NOTE: do NOT mount/open SD here. We mount per-flush or when MSC is turned on.
 
-  // --- MSC after SD ---
+  // --- MSC init (capacity will be updated when MSC is turned ON) ---
   usb_msc.setID("CQU", "ITSY SD", "1.0");
-  uint32_t block_count = 0;
-  if (sdOK && sd.card()) block_count = sd.card()->sectorCount();
-  if (block_count == 0)  block_count = 8;
-  usb_msc.setCapacity(block_count, 512);
+  usb_msc.setCapacity(8, 512); // placeholder; updated on MSC ON
   usb_msc.setReadWriteCallback(msc_read_cb, msc_write_cb, msc_flush_cb);
   usb_msc.setStartStopCallback(msc_startstop_cb);
   usb_msc.begin();
@@ -873,6 +909,9 @@ void setup(){
   // LEDs off
   pinMode(LED_BUILTIN, OUTPUT);
   digitalWrite(LED_BUILTIN, LOW);
+
+  // Ensure SPI bus starts asleep
+  sd_spi_bus_sleep();
 
   Serial.println("Type 'MSC ON' to mount SD over USB; 'MSC OFF' to resume logging.");
 }
@@ -989,7 +1028,7 @@ void loop(){
 #endif
 
   // ----- Time-based guard (keeps data moving at very low rates) -----
-  if (sdOK && RING_CAP_BYTES){
+  if (RING_CAP_BYTES){
     bool needTime = (FLUSH_MAX_HOLD_MS>0) && (now - lastFlushMs >= FLUSH_MAX_HOLD_MS) && (!inQuietMode());
     if (needTime) flushBuffers(false, FR_MAXHOLD);
   }
