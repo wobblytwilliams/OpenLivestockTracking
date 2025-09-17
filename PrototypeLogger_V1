@@ -1,0 +1,919 @@
+// Forward declaration so Arduino's auto-prototypes know the type used in push_event()
+struct LogEvent;
+
+// ItsyBitsy nRF52840 logger + USB MSC + BLE scanner + GPS duty cycle + low-power
+// - ADXL345 @ 12.5 Hz (I2C, low-power mode), GPS RMC via UART1 @ 9600
+// - GPS: wake -> wait -> log 1 row -> standby (every 3 minutes, UBX RXM-PMREQ standby/wake)
+// - BLE: passive scan to /BLE.CSV with per-window de-dup (MAC+RSSI)
+// - Unified event ring buffer sized at runtime from allocatable heap after init
+//   • Normal flush at 85% of that capacity; emergency at 87.25%
+//   • Event-driven flush hints set on each push; SD writes only from loop() (low power)
+//   • No periodic "fullness check" wakeup
+// - Disciplined UTC clock + 64-bit uptime; events stamped at CAPTURE time
+// - USB command: "MSC ON" / "MSC OFF" to expose/hide SD as a USB drive
+//
+// Serial Monitor: 115200
+
+#include <Wire.h>
+#include <SPI.h>
+#include <SdFat.h>
+#include <Adafruit_TinyUSB.h>   // TinyUSB (Serial + MSC)
+#include <bluefruit.h>          // Adafruit nRF52 Bluefruit (central scan)
+#include <string.h>
+#include <ctype.h>
+#include <math.h>
+
+#if defined(NRF52_SERIES)
+  // Use FreeRTOS allocators if present; avoid heap stat APIs (not always exported)
+  #include <FreeRTOS.h>
+  #include <task.h>
+  extern "C" void* pvPortMalloc(size_t);
+  extern "C" void  vPortFree(void*);
+  #define os_malloc pvPortMalloc
+  #define os_free   vPortFree
+#else
+  #include <stdlib.h>
+  #define os_malloc malloc
+  #define os_free   free
+#endif
+
+// ---------------- SD (SdFs/FsFile) ----------------
+const uint8_t SD_CS_PIN = 10;
+SdFs sd;
+SdSpiConfig sdCfg(SD_CS_PIN, DEDICATED_SPI, SD_SCK_MHZ(12));
+FsFile accelFile, gpsFile, bleFile;
+const char* ACCEL_FILE = "/ACCEL.CSV";
+const char* GPS_FILE   = "/GPS.CSV";
+const char* BLE_FILE   = "/BLE.CSV";
+
+// ---------------- USB MSC -------------------------
+Adafruit_USBD_MSC usb_msc;
+volatile bool mscReady = false;     // host can read/write when true
+bool mscMode  = false;              // user-controlled mode
+bool sdOK     = false;
+
+// ---------------- Rates & policy ------------------
+#define USB_BAUD              115200
+#define GPS_BAUD              9600
+#define ACCEL_PERIOD_MS       80        // ~12.5 Hz
+
+// Quiet mode windows
+#define QUIET_AFTER_SYNC_MS   400UL     // keep SPI quiet briefly after sync
+#define FIX_LOSS_GRACE_MS     3000UL    // no valid RMC seen for this long → acquiring
+
+// ---------------- GPS duty cycle (editable) ---------------
+#define GPS_SAMPLE_PERIOD_MS  180000UL  // 3 minutes between logged fixes
+#define GPS_WARMUP_MS         8000UL    // time after wake before accepting fix
+#define GPS_FIX_TIMEOUT_MS    45000UL   // main acquisition window
+#define GPS_RETRY_MS          8000UL    // one extra bite if we’d otherwise log NaN
+
+// ---------------- BLE scan schedule (editable) -------------
+#define BLE_CYCLE_PERIOD_MS   60000UL   // total cycle length
+#define BLE_ACTIVE_MS         5000UL    // scan length within cycle
+
+// BLE scan duty cycle (scan window / interval). 50% by default.
+#define BLE_SCAN_INTERVAL_MS  100
+#define BLE_SCAN_WINDOW_MS    50
+
+// BLE de-duplication toggle: 1 = log each MAC once per scan window; 0 = log every advert
+#define BLE_DEDUP_PER_WINDOW  1
+
+#if BLE_DEDUP_PER_WINDOW
+  #define BLE_SEEN_MAX 256
+  static uint8_t bleSeen[BLE_SEEN_MAX][6];   // MACs (little-endian as reported)
+  static size_t  bleSeenCount = 0;
+  static inline bool should_log_and_remember(const uint8_t macLE[6]){
+    for (size_t i = 0; i < bleSeenCount; i++){
+      if (memcmp(bleSeen[i], macLE, 6) == 0) return false;
+    }
+    if (bleSeenCount < BLE_SEEN_MAX){
+      memcpy(bleSeen[bleSeenCount++], macLE, 6);
+    }
+    return true;
+  }
+#endif
+
+// ====================================================================
+// 64-bit monotonic uptime
+// ====================================================================
+uint64_t uptime_ms64(){
+  static uint32_t prev32 = 0;
+  static uint64_t high   = 0;
+  uint32_t now32 = millis();
+  if (now32 < prev32) high += (1ULL << 32); // wrap
+  prev32 = now32;
+  return high | now32;
+}
+
+// ====================================================================
+// Disciplined UTC clock (UTC in ms) + helpers
+// ====================================================================
+struct ClockDisc {
+  double   scale    = 1.0;   // ms/ms (ppm correction)
+  double   phase_ms = 0.0;   // UTC ms at t0_ms
+  uint64_t t0_ms    = 0;     // uptime anchor (ms)
+  bool     synced   = false; // received at least one valid GPS UTC
+};
+ClockDisc g_clock;
+
+uint64_t utc_now_ms(){
+  if (!g_clock.synced) return 0;
+  uint64_t now_ms = uptime_ms64();
+  double dt = (double)(now_ms - g_clock.t0_ms);
+  double t_ms = g_clock.phase_ms + g_clock.scale * dt;
+  if (t_ms < 0) t_ms = 0;
+  return (uint64_t)(t_ms + 0.5);
+}
+uint32_t utc_now_s(){ return (uint32_t)(utc_now_ms() / 1000ULL); }
+uint16_t utc_now_ms_of_sec(){ return (uint16_t)(utc_now_ms() % 1000ULL); }
+bool     utc_time_valid(){ return g_clock.synced; }
+
+// Y/M/D → UNIX ms
+static const int mdays[12]={31,28,31,30,31,30,31,31,30,31,30,31};
+bool isLeap(int y){ return (y%4==0 && y%100!=0) || (y%400==0); }
+int  fullYearFromYY(int yy){ return 2000 + (yy%100); }
+uint32_t daysSince1970(int y,int m,int d){
+  uint32_t days=0; for(int yr=1970; yr<y; ++yr) days += isLeap(yr)?366:365;
+  for(int i=1;i<m;i++){ days += mdays[i-1]; if(i==2 && isLeap(y)) days++; }
+  return days + (d-1);
+}
+uint64_t unix_ms_from_ymdhms(int y,int m,int d,int hh,int mm,int ss){
+  return ((uint64_t)daysSince1970(y,m,d)*86400ULL + (uint64_t)hh*3600ULL + (uint64_t)mm*60ULL + (uint64_t)ss) * 1000ULL;
+}
+static inline bool plausibleYear(int yyyy){ return (yyyy >= 2020 && yyyy <= 2035); }
+
+// Legacy/acquire flags still used
+bool     timeSynced     = false;
+bool     syncEventFlag  = false;
+uint32_t lastValidRmcMs = 0;
+uint32_t noFlushUntilMs = 0;
+
+// GNSS time discipline hook (called from parseRMC)
+void time_on_gps_utc(int yyyy, int mo, int dd, int hh, int mi, int ss){
+  if (!plausibleYear(yyyy)) return;
+  uint64_t gps_utc_ms = unix_ms_from_ymdhms(yyyy, mo, dd, hh, mi, ss);
+  uint64_t now_ms     = uptime_ms64();
+
+  // Predict current model time and phase error
+  double pred_ms = g_clock.phase_ms + g_clock.scale * (double)(now_ms - g_clock.t0_ms);
+  double err_ms  = (double)gps_utc_ms - pred_ms;
+
+  // Slew cap (no big jumps)
+  const double SLEW_CAP_MS = 50.0;
+  if (err_ms < -SLEW_CAP_MS) err_ms = -SLEW_CAP_MS;
+  if (err_ms >  SLEW_CAP_MS) err_ms =  SLEW_CAP_MS;
+  g_clock.phase_ms += err_ms;
+
+  // Frequency refinement if ≥60 s have passed
+  static bool have_ref=false; static uint64_t ref_uptime=0, ref_gps=0;
+  if (!have_ref){ have_ref=true; ref_uptime=now_ms; ref_gps=gps_utc_ms; }
+  uint64_t du = now_ms - ref_uptime, dg = gps_utc_ms - ref_gps;
+  if (du >= 60000ULL){
+    double meas_scale = (double)dg / (double)du;      // ms/ms
+    const double A = 0.02;                            // gentle IIR
+    g_clock.scale = (1.0 - A)*g_clock.scale + A*meas_scale;
+    ref_uptime = now_ms; ref_gps = gps_utc_ms;
+  }
+
+  // Re-anchor
+  g_clock.t0_ms  = now_ms;
+  g_clock.synced = true;
+
+  // Legacy flags used by quiet mode
+  timeSynced    = true;
+  syncEventFlag = true;
+  noFlushUntilMs = millis() + QUIET_AFTER_SYNC_MS;
+}
+
+// ====================================================================
+// Unified event ring (types + storage + helpers) — dynamic capacity
+// ====================================================================
+enum EventType : uint8_t { EV_ACCEL=1, EV_GPS=2, EV_BLE=3 };
+
+struct AccelRow { uint32_t t_ms; uint32_t unix_s; float ax, ay, az; };
+struct GPSRow   { uint32_t t_ms; uint32_t unix_s; float lat, lon; uint8_t fix, sync; };
+struct BLERow   { uint32_t t_ms; uint32_t unix_s; uint8_t mac[6]; int8_t rssi; };
+
+// Union sized to largest payload
+union EventPayload { AccelRow accel; GPSRow gps; BLERow ble; };
+
+// Renamed from "Event" to avoid any library collisions
+struct LogEvent { EventType type; EventPayload p; };
+
+// Dynamic ring buffer fields
+static LogEvent* g_events      = nullptr;
+static size_t    g_event_cap   = 0;     // max number of events allocated
+static size_t    g_event_count = 0;
+
+static size_t    RING_CAP_BYTES  = 0;   // g_event_cap * sizeof(LogEvent)
+static size_t    NORMAL_THRESH_B = 0;   // 85% of capacity
+static size_t    EMERG_THRESH_B  = 0;   // 87.25%
+
+// Fallback (only used if heap alloc fails)
+#define FALLBACK_EVENT_MAX 512
+static LogEvent g_events_fallback[FALLBACK_EVENT_MAX];
+
+// Max hold guard (forces occasional flush at very low rates)
+#define FLUSH_MAX_HOLD_MS 900000UL  // set to 0 to disable
+
+inline size_t  ring_used_bytes()   { return g_event_count * sizeof(LogEvent); }
+inline uint8_t ring_fullness_pct() { return (RING_CAP_BYTES ? (uint8_t)((ring_used_bytes() * 100U) / RING_CAP_BYTES) : 100); }
+
+// Flush hint (set on each push; serviced in loop())
+volatile uint8_t g_flushHint = 0; // 0 none, 1 normal, 2 emergency
+
+inline void note_flush_thresholds() {
+  size_t usedB = ring_used_bytes();
+  if (usedB >= EMERG_THRESH_B) g_flushHint = 2;
+  else if (usedB >= NORMAL_THRESH_B && g_flushHint < 2) g_flushHint = 1;
+}
+
+// Probe the allocator to find the largest contiguous block we can get right now.
+size_t find_max_contiguous_block(size_t max_limit = (1u<<21)) { // cap ~2 MB (>> 256 KB SRAM)
+  size_t ok = 0;
+  size_t trySize = 1024; // 1 KB start
+  void* p = nullptr;
+
+  // Exponential growth until failure or limit
+  while (trySize <= max_limit) {
+    p = os_malloc(trySize);
+    if (!p) break;
+    os_free(p);
+    ok = trySize;
+    trySize <<= 1;
+  }
+
+  // Binary search between last ok and first fail
+  size_t lo = ok, hi = trySize;
+  while (hi > lo + 1024) { // 1 KB resolution
+    size_t mid = lo + (hi - lo)/2;
+    p = os_malloc(mid);
+    if (p) { os_free(p); lo = mid; }
+    else   { hi = mid; }
+  }
+  return lo; // largest contiguous allocatable block (approx)
+}
+
+bool push_event(const LogEvent& e){
+  if (!g_events || g_event_count >= g_event_cap) return false;
+  g_events[g_event_count++] = e;
+  return true;
+}
+
+// Allocate the ring from the *current* allocatable block after init.
+void alloc_event_ring_from_heap(){
+  size_t maxBlock = find_max_contiguous_block();
+  const size_t reserve = 8 * 1024;                   // ~8 KB safety headroom
+  size_t usable = (maxBlock > reserve) ? (maxBlock - reserve) : (maxBlock / 2);
+
+  size_t cap = usable / sizeof(LogEvent);
+  const size_t min_events = 256;
+  const size_t max_events = 8000;                    // safety upper bound
+  if (cap < min_events) cap = min_events;
+  if (cap > max_events) cap = max_events;
+
+  // Try to allocate; back off a bit if it fails
+  for (int tries = 0; tries < 6; ++tries) {
+    g_events = (LogEvent*) os_malloc(cap * sizeof(LogEvent));
+    if (g_events) break;
+    cap = (cap * 95) / 100;                          // back off 5%
+    if (cap < min_events) break;
+  }
+
+  if (!g_events) {
+    g_events     = g_events_fallback;
+    g_event_cap  = FALLBACK_EVENT_MAX;
+  } else {
+    g_event_cap  = cap;
+  }
+
+  RING_CAP_BYTES  = g_event_cap * sizeof(LogEvent);
+  NORMAL_THRESH_B = (RING_CAP_BYTES * 85)   / 100;   // 85.00%
+  EMERG_THRESH_B  = (RING_CAP_BYTES * 8725) / 10000; // 87.25%
+
+  Serial.print("Event size="); Serial.print((int)sizeof(LogEvent));
+  Serial.print(" bytes, ring events="); Serial.print(g_event_cap);
+  Serial.print(" ("); Serial.print((unsigned long)RING_CAP_BYTES); Serial.println(" bytes)");
+  Serial.print("Flush thresholds: normal @ "); Serial.print((unsigned long)NORMAL_THRESH_B);
+  Serial.print(" B (85%), emergency @ "); Serial.print((unsigned long)EMERG_THRESH_B);
+  Serial.println(" B (87.25%)");
+}
+
+// ====================================================================
+// ADXL345 (I2C)
+// ====================================================================
+static uint8_t ADXL_ADDR=0x1D; // auto-probe to 0x53 if needed
+bool i2cWrite8(uint8_t a,uint8_t r,uint8_t v){ Wire.beginTransmission(a); Wire.write(r); Wire.write(v); return Wire.endTransmission()==0; }
+bool i2cReadBytes(uint8_t a,uint8_t r,uint8_t* b,size_t n){
+  Wire.beginTransmission(a); Wire.write(r);
+  if(Wire.endTransmission(false)!=0) return false;
+  size_t got=Wire.requestFrom((int)a,(int)n);
+  for(size_t i=0;i<got && i<n;i++) b[i]=Wire.read();
+  return got==n;
+}
+uint8_t i2cRead8(uint8_t a,uint8_t r){ uint8_t v=0; i2cReadBytes(a,r,&v,1); return v; }
+bool adxl_init(){
+  uint8_t id=i2cRead8(ADXL_ADDR,0x00);
+  if(id!=0xE5){ ADXL_ADDR=(ADXL_ADDR==0x1D)?0x53:0x1D; id=i2cRead8(ADXL_ADDR,0x00); if(id!=0xE5) return false; }
+  i2cWrite8(ADXL_ADDR,0x2C,0x17); // LOW_POWER=1, rate=12.5Hz
+  i2cWrite8(ADXL_ADDR,0x31,0x00); // ±2g, 10-bit
+  i2cWrite8(ADXL_ADDR,0x2D,0x08); // MEASURE=1
+  return true;
+}
+bool adxl_read(int16_t &x,int16_t &y,int16_t &z){
+  uint8_t b[6]; if(!i2cReadBytes(ADXL_ADDR,0x32,b,6)) return false;
+  x=(int16_t)(b[1]<<8|b[0]); y=(int16_t)(b[3]<<8|b[2]); z=(int16_t)(b[5]<<8|b[4]); return true;
+}
+inline float to_g(int16_t c){ return c*0.0039f; }
+
+// ====================================================================
+// NMEA (RMC) parsing
+// ====================================================================
+static const size_t NMEA_MAX=160;
+char   nmeaLine[NMEA_MAX]; size_t nmeaIdx=0; bool nmeaOverflow=false;
+bool   gpsValid=false; float gpsLat=NAN, gpsLon=NAN;
+uint32_t gpsSessionStart = 0; // used by RMC freshness check
+bool sawRmcThisSession = false;
+
+static inline int hexval(char h){
+  if(h>='0' && h<='9') return h-'0';
+  h = toupper((unsigned char)h);
+  if(h>='A' && h<='F') return h-'A'+10;
+  return -1;
+}
+bool nmeaChecksumOk(const char* s){
+  const char* star = strrchr(s, '*');
+  if(!s || s[0] != '$' || !star || star[1] == 0 || star[2] == 0) return false;
+  uint8_t cs=0;
+  for(const char* p=s+1; p<star; ++p) cs ^= (uint8_t)(*p);
+  int want = (hexval(star[1])<<4) | hexval(star[2]);
+  return want>=0 && cs == (uint8_t)want;
+}
+float nmeaCoord(const char* ddmm){
+  if(!ddmm||!*ddmm) return NAN;
+  const char* dot=strchr(ddmm,'.'); if(!dot) return NAN;
+  int degDigits=((dot-ddmm)>4)?3:2; char db[4]={0}; strncpy(db,ddmm,degDigits);
+  int deg=atoi(db); float mins=atof(ddmm+degDigits);
+  return deg + mins / 60.0f;
+}
+void parseRMC(char* s){
+  // $--RMC,time,status,lat,NS,lon,EW,speed,cog,date,...
+  char* p=strchr(s,','); if(!p) return; *p++=0; char* timestr=p;
+  p=strchr(p,','); if(!p) return; *p++=0; char* status=p;
+  p=strchr(p,','); if(!p) return; *p++=0; char* latF=p;
+  p=strchr(p,','); if(!p) return; *p++=0; char* ns=p;
+  p=strchr(p,','); if(!p) return; *p++=0; char* lonF=p;
+  p=strchr(p,','); if(!p) return; *p++=0; char* ew=p;
+  p=strchr(p,','); if(!p) return; *p++=0; p=strchr(p,','); if(!p) return; *p++=0; char* datestr=p;
+
+  bool valid = (*status=='A');
+  float lat = nmeaCoord(latF), lon = nmeaCoord(lonF);
+  if(ns&&*ns=='S') lat=-lat; if(ew&&*ew=='W') lon=-lon;
+
+  if(valid && !isnan(lat) && !isnan(lon)){
+    gpsValid = true; gpsLat = lat; gpsLon = lon; lastValidRmcMs = millis();
+    if (lastValidRmcMs >= gpsSessionStart) sawRmcThisSession = true;
+
+    int hh=0,mi=0,ss=0,dd=1,mo=1,yy=0;
+    if(timestr && strlen(timestr)>=6){ hh=(timestr[0]-'0')*10+(timestr[1]-'0'); mi=(timestr[2]-'0')*10+(timestr[3]-'0'); ss=(timestr[4]-'0')*10+(timestr[5]-'0'); }
+    if(datestr && strlen(datestr)>=6){ dd=(datestr[0]-'0')*10+(datestr[1]-'0'); mo=(datestr[2]-'0')*10+(datestr[3]-'0'); yy=(datestr[4]-'0')*10+(datestr[5]-'0'); }
+    int yyyy = fullYearFromYY(yy);
+
+    time_on_gps_utc(yyyy, mo, dd, hh, mi, ss); // discipline clock
+  } else {
+    gpsValid = false;
+  }
+}
+void pumpGPS(){
+  while(Serial1.available()){
+    int c=Serial1.read(); if(c<0) break; if(c=='\r') continue;
+    if(c=='\n'){
+      if(!nmeaOverflow){
+        nmeaLine[min(nmeaIdx,NMEA_MAX-1)] = '\0';
+        if (nmeaLine[0]=='$' && strstr(nmeaLine, "RMC") && nmeaChecksumOk(nmeaLine)){
+          parseRMC(nmeaLine);
+        }
+      }
+      nmeaIdx=0; nmeaOverflow=false;
+    } else {
+      if(nmeaIdx < NMEA_MAX-2) nmeaLine[nmeaIdx++] = (char)c;
+      else nmeaOverflow = true; // discard this sentence until newline
+    }
+  }
+}
+
+// ====================================================================
+// GPS standby/wake (u-blox UBX)
+// ====================================================================
+void sendUBX(uint8_t cls, uint8_t id, const uint8_t* payload, uint16_t len){
+  uint8_t ckA = 0, ckB = 0;
+  auto upd = [&](uint8_t b){ ckA = ckA + b; ckB = ckB + ckA; Serial1.write(b); };
+  Serial1.write(0xB5); Serial1.write(0x62);
+  upd(cls); upd(id);
+  upd(len & 0xFF); upd((len >> 8) & 0xFF);
+  for(uint16_t i=0;i<len;i++) upd(payload[i]);
+  Serial1.write(ckA); Serial1.write(ckB);
+}
+// UBX-RXM-PMREQ (0x02 0x41): version=0, duration=0; flags.force=1; wakeupSources.uartrx=1
+void gpsStandby(){
+  uint8_t p[16]; memset(p, 0, sizeof(p));
+  uint32_t flags = (1u << 2); // force
+  memcpy(&p[8],  &flags, 4);
+  uint32_t wake  = (1u << 3); // uartrx
+  memcpy(&p[12], &wake,  4);
+  sendUBX(0x02, 0x41, p, sizeof(p));
+  Serial1.flush();
+}
+void gpsWake(){ Serial1.write('\r'); Serial1.write('\n'); Serial1.flush(); }
+
+// ====================================================================
+// BLE helpers + callback → EV_BLE
+// ====================================================================
+static inline uint16_t BLE_UNITS(float ms) { return (uint16_t)((ms / 0.625f) + 0.5f); }
+void macToStrMSB(const uint8_t macLE[6], char out[18]) {
+  static const char kHexChars[] = "0123456789ABCDEF";
+  int o=0;
+  for(int i=5;i>=0;--i){
+    uint8_t b = macLE[i];
+    out[o++] = kHexChars[(b>>4)&0x0F];
+    out[o++] = kHexChars[b&0x0F];
+    if(i) out[o++]=':';
+  }
+  out[o]='\0';
+}
+
+// Scan state
+bool     bleActive = false;
+uint32_t bleStartMs = 0;
+uint32_t lastBleCycleStartMs = 0;
+
+// Forward decl for flush used in callback
+void flushBuffers(bool emergency);
+
+void startBleScan();
+void stopBleScan();
+
+// BLE report callback
+void scan_callback(ble_gap_evt_adv_report_t* report)
+{
+  if (mscMode) { Bluefruit.Scanner.resume(); return; }
+
+  bool allow_log =
+  #if BLE_DEDUP_PER_WINDOW
+    should_log_and_remember(report->peer_addr.addr);
+  #else
+    true;
+  #endif
+
+  if (allow_log){
+    LogEvent e; e.type = EV_BLE;
+    e.p.ble.t_ms   = (uint32_t)millis();
+    e.p.ble.unix_s = utc_time_valid() ? utc_now_s() : 0;
+    memcpy(e.p.ble.mac, report->peer_addr.addr, 6);
+    e.p.ble.rssi   = report->rssi;
+
+    if (!push_event(e)){ flushBuffers(true); (void)push_event(e); }
+    else { note_flush_thresholds(); }
+  }
+  Bluefruit.Scanner.resume();
+}
+
+void startBleScan() {
+  if (mscMode || bleActive) return;
+  #if BLE_DEDUP_PER_WINDOW
+    bleSeenCount = 0;
+  #endif
+  Bluefruit.Scanner.start(0);       // indefinite; stop after BLE_ACTIVE_MS
+  bleStartMs = millis();
+  bleActive  = true;
+}
+void stopBleScan() {
+  if (!bleActive) return;
+  Bluefruit.Scanner.stop();
+  bleActive = false;
+  lastBleCycleStartMs = millis();
+}
+
+// ====================================================================
+// GPS scheduler + flush logic
+// ====================================================================
+bool     gpsSessionActive = false;
+uint32_t lastGpsSampleMs  = 0;
+uint32_t acqDeadline      = 0;
+bool     retryUsed        = false;
+
+// SD flush timing
+uint32_t lastFlushMs = 0;
+
+bool inQuietMode(){
+  uint32_t now = millis();
+  bool justSynced = (now < noFlushUntilMs);
+  bool acquiring = gpsSessionActive && ((!timeSynced) || (now - lastValidRmcMs > FIX_LOSS_GRACE_MS));
+  return acquiring || justSynced;
+}
+
+void flushBuffers(bool emergency){
+  if(!sdOK) return;
+  if(!emergency && inQuietMode()) return;
+
+  // Stats
+  size_t n_acc = 0, n_gps = 0, n_ble = 0;
+  size_t beforeBytes = ring_used_bytes();
+  uint32_t t0 = millis();
+
+  // Write all pending events to their files
+  for(size_t i=0;i<g_event_count;i++){
+    const LogEvent& ev = g_events[i];
+    switch(ev.type){
+      case EV_ACCEL: {
+        const auto& r = ev.p.accel;
+        if(accelFile){
+          accelFile.print(r.t_ms); accelFile.print(',');
+          if (r.unix_s) accelFile.print(r.unix_s);
+          accelFile.print(',');
+          accelFile.print(r.ax,4); accelFile.print(',');
+          accelFile.print(r.ay,4); accelFile.print(',');
+          accelFile.println(r.az,4);
+          n_acc++;
+        }
+      } break;
+
+      case EV_GPS: {
+        const auto& r = ev.p.gps;
+        if(gpsFile){
+          gpsFile.print(r.t_ms); gpsFile.print(',');
+          if (r.unix_s) gpsFile.print(r.unix_s);
+          gpsFile.print(',');
+          if(isnan(r.lat)) gpsFile.print("NaN"); else gpsFile.print(r.lat,6);
+          gpsFile.print(',');
+          if(isnan(r.lon)) gpsFile.print("NaN"); else gpsFile.print(r.lon,6);
+          gpsFile.print(',');
+          gpsFile.print(r.fix); gpsFile.print(',');
+          gpsFile.println(r.sync);
+          n_gps++;
+        }
+      } break;
+
+      case EV_BLE: {
+        const auto& r = ev.p.ble;
+        if(bleFile){
+          char macStr[18]; macToStrMSB(r.mac, macStr);
+          bleFile.print(r.t_ms); bleFile.print(',');
+          if (r.unix_s) bleFile.print(r.unix_s);
+          bleFile.print(',');
+          bleFile.print(macStr); bleFile.print(',');
+          bleFile.println(r.rssi);
+          n_ble++;
+        }
+      } break;
+    }
+  }
+
+  // Flush files
+  if (accelFile) accelFile.flush();
+  if (gpsFile)   gpsFile.flush();
+  if (bleFile)   bleFile.flush();
+
+  g_event_count = 0;
+  lastFlushMs   = millis();
+
+  // Report
+  uint32_t dt = lastFlushMs - t0;
+  Serial.print("[FLUSH] ");
+  Serial.print(emergency ? "EMERGENCY" : "normal");
+  Serial.print(" wrote A="); Serial.print(n_acc);
+  Serial.print(" G=");       Serial.print(n_gps);
+  Serial.print(" B=");       Serial.print(n_ble);
+  Serial.print(" total=");   Serial.print(n_acc + n_gps + n_ble);
+  Serial.print(" bytes_before="); Serial.print((unsigned long)beforeBytes);
+  Serial.print(" pct_before=");
+  Serial.print(RING_CAP_BYTES ? (int)((beforeBytes * 100U) / RING_CAP_BYTES) : 0);
+  Serial.print("% dt_ms=");  Serial.println((int)dt);
+}
+
+
+// ====================================================================
+// Serial command parser + MSC callbacks
+// ====================================================================
+String cmdLine;
+
+static int32_t msc_read_cb (uint32_t lba, void* buffer, uint32_t bufsize) {
+  if (!mscReady || !sdOK) return -1;
+  uint32_t count = bufsize / 512;
+  SdCard* card = sd.card();
+  if (!card) return -1;
+  for (uint32_t i=0; i<count; i++) {
+    if (!card->readSector(lba + i, (uint8_t*)buffer + i*512)) return -1;
+  }
+  return (int32_t)bufsize;
+}
+static int32_t msc_write_cb (uint32_t lba, uint8_t* buffer, uint32_t bufsize) {
+  if (!mscReady || !sdOK) return -1;
+  uint32_t count = bufsize / 512;
+  SdCard* card = sd.card();
+  if (!card) return -1;
+  for (uint32_t i=0; i<count; i++) {
+    if (!card->writeSector(lba + i, (uint8_t*)buffer + i*512)) return -1;
+  }
+  return (int32_t)bufsize;
+}
+static void msc_flush_cb (void) {
+  if (!sdOK) return;
+  SdCard* card = sd.card();
+  if (card) card->syncDevice();
+}
+static bool msc_startstop_cb (uint8_t power_condition, bool start, bool load_eject) {
+  (void)power_condition; (void)load_eject;
+  mscReady = start && sdOK;
+  return true;
+}
+
+void setMSC(bool on){
+  if (on == mscMode) {
+    Serial.print("MSC already "); Serial.println(on ? "ON" : "OFF");
+    return;
+  }
+  if (on) {
+    Serial.println("MSC ON: stopping logging, flushing & closing files…");
+    stopBleScan();
+    flushBuffers(true);
+    if (accelFile) accelFile.close();
+    if (gpsFile)   gpsFile.close();
+    if (bleFile)   bleFile.close();
+
+    if (!sdOK || !sd.card()){
+      Serial.println("MSC ON: SD not initialized/absent.");
+      return;
+    }
+    uint32_t bc = sd.card()->sectorCount();
+    usb_msc.setCapacity(bc ? bc : 8, 512);
+    mscReady = true;
+    usb_msc.setUnitReady(true);
+    mscMode = true;
+
+    Serial.println("MSC ON: re-enumerating USB to prompt host mount…");
+    TinyUSBDevice.detach(); delay(300); TinyUSBDevice.attach();
+    Serial.println("MSC ON: SD should now appear on the PC.");
+  } else {
+    Serial.println("MSC OFF: unmounting from host…");
+    mscReady = false;
+    usb_msc.setUnitReady(false);
+    delay(10);
+    TinyUSBDevice.detach(); delay(300); TinyUSBDevice.attach();
+
+    Serial.println("MSC OFF: reopening files & resuming logging.");
+    accelFile = sd.open(ACCEL_FILE, O_RDWR | O_CREAT | O_AT_END);
+    gpsFile   = sd.open(GPS_FILE,   O_RDWR | O_CREAT | O_AT_END);
+    bleFile   = sd.open(BLE_FILE,   O_RDWR | O_CREAT | O_AT_END);
+    if (accelFile && accelFile.fileSize()==0) accelFile.println("t_ms,unix_s,ax,ay,az");
+    if (gpsFile   && gpsFile.fileSize()==0)   gpsFile.println("t_ms,unix_s,lat,lon,fix,sync");
+    if (bleFile   && bleFile.fileSize()==0)   bleFile.println("t_ms,unix_s,mac,rssi");
+    mscMode = false;
+
+    // Kick BLE/GPS schedules so they start soon
+    lastBleCycleStartMs = millis() - BLE_CYCLE_PERIOD_MS;
+    lastGpsSampleMs     = millis() - GPS_SAMPLE_PERIOD_MS;
+  }
+}
+
+void handleSerialCommands(){
+  while (Serial.available()){
+    char c = (char)Serial.read();
+    if (c == '\r') continue;
+    if (c == '\n'){
+      cmdLine.trim();
+      if (cmdLine.length()){
+        String up = cmdLine; up.toUpperCase();
+        if (up == "MSC ON" || up == "USBMSC 1" || up == "MSC=1") setMSC(true);
+        else if (up == "MSC OFF" || up == "USBMSC 0" || up == "MSC=0") setMSC(false);
+        else if (up == "STATUS"){
+          Serial.print("MSC="); Serial.print(mscMode?1:0);
+          Serial.print(" SD=");  Serial.print(sdOK?1:0);
+          Serial.print(" files(");
+          Serial.print((bool)accelFile); Serial.print(',');
+          Serial.print((bool)gpsFile);   Serial.print(',');
+          Serial.print((bool)bleFile);   Serial.print(')');
+          Serial.print(" events="); Serial.print(g_event_count);
+          Serial.print('/'); Serial.print(g_event_cap);
+          Serial.print(" %full="); Serial.print((int)ring_fullness_pct());
+          Serial.print(" usedB="); Serial.print((unsigned long)ring_used_bytes());
+          Serial.print('/'); Serial.println((unsigned long)RING_CAP_BYTES);
+        } else {
+          Serial.print("Unknown cmd: "); Serial.println(cmdLine);
+          Serial.println("Use: 'MSC ON' or 'MSC OFF' (or 'USBMSC 1/0')");
+        }
+      }
+      cmdLine = "";
+    } else {
+      cmdLine += c;
+      if (cmdLine.length() > 64) cmdLine = "";
+    }
+  }
+}
+
+// ====================================================================
+//
+// Low-power sleep helper, Setup, Loop
+//
+// ====================================================================
+extern "C" uint32_t sd_app_evt_wait(void);
+static inline void lowPowerIdleUntil(uint32_t deadline_ms){
+  while ((int32_t)(deadline_ms - millis()) > 0){
+    sd_app_evt_wait(); // sleep until any event (BLE, timers, UART, etc.)
+  }
+}
+
+void setup(){
+  Serial.begin(USB_BAUD);
+  uint32_t t0=millis(); while(!Serial && millis()-t0<2000){} // brief wait
+  Serial.println("\n=== Logger + MSC + BLE + GPS duty-cycle + low-power ===");
+
+  Wire.begin();
+  Serial1.begin(GPS_BAUD);
+
+  // ADXL345
+  if(!adxl_init()) Serial.println("ADXL345 not found");
+  else Serial.println("ADXL345 @ 12.5 Hz (low-power) OK");
+
+  // --- SD first ---
+  Serial.print("Init SD @ 12 MHz… ");
+  sdOK = sd.begin(sdCfg);
+  if(!sdOK){
+    Serial.println("FAIL (MSC can still be enabled after SD works)");
+  } else {
+    Serial.println("OK");
+    accelFile = sd.open(ACCEL_FILE, O_RDWR | O_CREAT | O_AT_END);
+    gpsFile   = sd.open(GPS_FILE,   O_RDWR | O_CREAT | O_AT_END);
+    bleFile   = sd.open(BLE_FILE,   O_RDWR | O_CREAT | O_AT_END);
+    if(accelFile && accelFile.fileSize()==0) accelFile.println("t_ms,unix_s,ax,ay,az");
+    if(gpsFile   && gpsFile.fileSize()==0)   gpsFile.println("t_ms,unix_s,lat,lon,fix,sync");
+    if(bleFile   && bleFile.fileSize()==0)   bleFile.println("t_ms,unix_s,mac,rssi");
+  }
+
+  // --- MSC after SD ---
+  usb_msc.setID("CQU", "ITSY SD", "1.0");
+  uint32_t block_count = 0;
+  if (sdOK && sd.card()) block_count = sd.card()->sectorCount();
+  if (block_count == 0)  block_count = 8;
+  usb_msc.setCapacity(block_count, 512);
+  usb_msc.setReadWriteCallback(msc_read_cb, msc_write_cb, msc_flush_cb);
+  usb_msc.setStartStopCallback(msc_startstop_cb);
+  usb_msc.begin();
+  usb_msc.setUnitReady(false);
+
+  // --- BLE (Central scanner) ---
+  Bluefruit.autoConnLed(false);
+  Bluefruit.begin(0, 1);
+  Bluefruit.setTxPower(-20);
+  Bluefruit.Scanner.setRxCallback(scan_callback);
+  Bluefruit.Scanner.useActiveScan(false);
+  Bluefruit.Scanner.setInterval(
+    BLE_UNITS(BLE_SCAN_INTERVAL_MS),
+    BLE_UNITS(BLE_SCAN_WINDOW_MS)
+  );
+
+  // Start schedulers soon
+  lastBleCycleStartMs = millis() - BLE_CYCLE_PERIOD_MS;
+  lastGpsSampleMs     = millis() - GPS_SAMPLE_PERIOD_MS;
+
+  // Allocate the unified ring from the allocator's current limit after init
+  alloc_event_ring_from_heap();
+
+  // LEDs off
+  pinMode(LED_BUILTIN, OUTPUT);
+  digitalWrite(LED_BUILTIN, LOW);
+
+  Serial.println("Type 'MSC ON' to mount SD over USB; 'MSC OFF' to resume logging.");
+}
+
+static inline uint32_t min3(uint32_t a, uint32_t b, uint32_t c){ return min(a, min(b, c)); }
+
+void startGpsSession(){
+  gpsWake();
+  gpsSessionActive   = true;
+  gpsSessionStart    = millis();
+  gpsValid           = false;         // fresh-only
+  syncEventFlag      = false;
+  sawRmcThisSession  = false;
+  acqDeadline        = gpsSessionStart + GPS_WARMUP_MS + GPS_FIX_TIMEOUT_MS;
+  retryUsed          = false;
+}
+void stopGpsSession(){
+  gpsStandby();
+  gpsSessionActive = false;
+}
+
+void loop(){
+  handleSerialCommands();
+
+  // If MSC mode is ON, pause everything except command handling
+  if (mscMode) {
+    sd_app_evt_wait();
+    return;
+  }
+
+  // Normal operation
+  pumpGPS();
+
+  // --- Service per-push flush hints ASAP (event-driven, low power) ---
+  if (g_flushHint == 2) {                // emergency
+    flushBuffers(true);
+    g_flushHint = 0;
+  } else if (g_flushHint == 1) {         // normal
+    if (!inQuietMode()) flushBuffers(false);
+    g_flushHint = 0;
+  }
+
+  uint32_t now = millis();
+
+  // ----- BLE scan scheduler -----
+  if (!bleActive) {
+    if (now - lastBleCycleStartMs >= BLE_CYCLE_PERIOD_MS) startBleScan();
+  } else {
+    if (now - bleStartMs >= BLE_ACTIVE_MS) stopBleScan();
+  }
+
+  // ----- GPS 3-minute scheduler with one-shot retry -----
+  if (!gpsSessionActive) {
+    if (now - lastGpsSampleMs >= GPS_SAMPLE_PERIOD_MS) {
+      startGpsSession();
+    }
+  } else {
+    bool warmed = (now - gpsSessionStart >= GPS_WARMUP_MS);
+    bool timed  = (now >= acqDeadline);
+    bool fresh  = (lastValidRmcMs >= gpsSessionStart);
+
+    if (warmed && fresh && gpsValid) {
+      // EV_GPS fix row
+      LogEvent e; e.type = EV_GPS;
+      e.p.gps.t_ms   = (uint32_t)millis();
+      e.p.gps.unix_s = utc_time_valid() ? utc_now_s() : 0;
+      e.p.gps.lat    = gpsLat;
+      e.p.gps.lon    = gpsLon;
+      e.p.gps.fix    = 1;
+      e.p.gps.sync   = (syncEventFlag ? 1 : 0);
+
+      if (!push_event(e)){ flushBuffers(true); (void)push_event(e); }
+      else { note_flush_thresholds(); }
+
+      syncEventFlag   = false;
+      stopGpsSession();
+      lastGpsSampleMs = now;
+
+    } else if (timed) {
+      if (!retryUsed && sawRmcThisSession) {
+        acqDeadline += GPS_RETRY_MS;   // one extra bite
+        retryUsed = true;
+      } else {
+        // EV_GPS NaN row
+        LogEvent e; e.type = EV_GPS;
+        e.p.gps.t_ms   = (uint32_t)millis();
+        e.p.gps.unix_s = utc_time_valid() ? utc_now_s() : 0;
+        e.p.gps.lat    = NAN;
+        e.p.gps.lon    = NAN;
+        e.p.gps.fix    = 0;
+        e.p.gps.sync   = 0;
+
+        if (!push_event(e)){ flushBuffers(true); (void)push_event(e); }
+        else { note_flush_thresholds(); }
+
+        stopGpsSession();
+        lastGpsSampleMs = now;
+      }
+    }
+  }
+
+  // ----- Accel @ ~12.5 Hz → EV_ACCEL -----
+  static uint32_t nextAccelDue = 0;
+  if (now >= nextAccelDue){
+    nextAccelDue = now + ACCEL_PERIOD_MS;
+    int16_t x,y,z;
+    if(adxl_read(x,y,z)){
+      LogEvent e; e.type = EV_ACCEL;
+      e.p.accel.t_ms   = (uint32_t)millis();
+      e.p.accel.unix_s = utc_time_valid() ? utc_now_s() : 0;
+      e.p.accel.ax     = to_g(x);
+      e.p.accel.ay     = to_g(y);
+      e.p.accel.az     = to_g(z);
+
+      if (!push_event(e)){ flushBuffers(true); (void)push_event(e); }
+      else { note_flush_thresholds(); }
+    }
+  }
+
+  // ----- Time-based guard (optional; keeps data moving at very low rates) -----
+  if (sdOK && RING_CAP_BYTES){
+    bool needTime = (FLUSH_MAX_HOLD_MS>0) && (now - lastFlushMs >= FLUSH_MAX_HOLD_MS) && (!inQuietMode());
+    if (needTime) flushBuffers(false);
+  }
+
+  // ----- Low-power sleep until the next interesting moment (no periodic fullness wake) -----
+  uint32_t nextBle = bleActive ? (bleStartMs + BLE_ACTIVE_MS) : (lastBleCycleStartMs + BLE_CYCLE_PERIOD_MS);
+  uint32_t nextGps = gpsSessionActive
+                     ? min(gpsSessionStart + GPS_WARMUP_MS, acqDeadline)
+                     : (lastGpsSampleMs + GPS_SAMPLE_PERIOD_MS);
+  uint32_t deadline = min3(nextAccelDue, nextBle, nextGps);
+
+  if ((int32_t)(deadline - now) > 0) lowPowerIdleUntil(deadline);
+  else sd_app_evt_wait();
+}
