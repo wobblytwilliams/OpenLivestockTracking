@@ -2,13 +2,12 @@
 struct LogEvent;
 
 // ItsyBitsy nRF52840 logger + USB MSC + BLE scanner + GPS duty cycle + low-power
-// - ADXL345 @ 12.5 Hz (I2C, low-power mode), GPS RMC via UART1 @ 9600
+// - ADXL345 @ 12.5 Hz (I2C, low-power mode), FIFO STREAM + polling (no INT pin)
 // - GPS: wake -> wait -> log 1 row -> standby (every 3 minutes, UBX RXM-PMREQ standby/wake)
 // - BLE: passive scan to /BLE.CSV with per-window de-dup (MAC+RSSI)
 // - Unified event ring buffer sized at runtime from allocatable heap after init
 //   • Normal flush at 85% of that capacity; emergency at 87.25%
 //   • Event-driven flush hints set on each push; SD writes only from loop() (low power)
-//   • No periodic "fullness check" wakeup
 // - Disciplined UTC clock + 64-bit uptime; events stamped at CAPTURE time
 // - USB command: "MSC ON" / "MSC OFF" to expose/hide SD as a USB drive
 //
@@ -24,7 +23,7 @@ struct LogEvent;
 #include <math.h>
 
 #if defined(NRF52_SERIES)
-  // Use FreeRTOS allocators if present; avoid heap stat APIs (not always exported)
+  // Use FreeRTOS allocators if present
   #include <FreeRTOS.h>
   #include <task.h>
   extern "C" void* pvPortMalloc(size_t);
@@ -64,8 +63,8 @@ bool sdOK     = false;
 // ---------------- GPS duty cycle (editable) ---------------
 #define GPS_SAMPLE_PERIOD_MS  180000UL  // 3 minutes between logged fixes
 #define GPS_WARMUP_MS         8000UL    // time after wake before accepting fix
-#define GPS_FIX_TIMEOUT_MS    45000UL   // main acquisition window
-#define GPS_RETRY_MS          8000UL    // one extra bite if we’d otherwise log NaN
+#define GPS_FIX_TIMEOUT_MS    10000UL   // main acquisition window
+#define GPS_RETRY_MS          2000UL    // one extra bite if we’d otherwise log NaN
 
 // ---------------- BLE scan schedule (editable) -------------
 #define BLE_CYCLE_PERIOD_MS   60000UL   // total cycle length
@@ -77,6 +76,11 @@ bool sdOK     = false;
 
 // BLE de-duplication toggle: 1 = log each MAC once per scan window; 0 = log every advert
 #define BLE_DEDUP_PER_WINDOW  1
+
+// ---- ADXL345 FIFO config (no interrupt pin yet) ----
+#define ACCEL_USE_FIFO_INT      0          // 0 = poll FIFO; 1 = use INT pin later
+#define ACCEL_FIFO_WATERMARK    24         // 1..32; 24 is a good sweet spot at 12.5 Hz
+#define ACCEL_INT_PIN           9          // used only if ACCEL_USE_FIFO_INT == 1
 
 #if BLE_DEDUP_PER_WINDOW
   #define BLE_SEEN_MAX 256
@@ -148,42 +152,21 @@ bool     syncEventFlag  = false;
 uint32_t lastValidRmcMs = 0;
 uint32_t noFlushUntilMs = 0;
 
-// GNSS time discipline hook (called from parseRMC)
-void time_on_gps_utc(int yyyy, int mo, int dd, int hh, int mi, int ss){
-  if (!plausibleYear(yyyy)) return;
-  uint64_t gps_utc_ms = unix_ms_from_ymdhms(yyyy, mo, dd, hh, mi, ss);
-  uint64_t now_ms     = uptime_ms64();
+// ------------------ Flush reasons (declare EARLY) --------------------
+enum FlushReason : uint8_t { FR_THRESHOLD=0, FR_EMERGENCY=1, FR_MAXHOLD=2, FR_MSC=3, FR_MANUAL=4 };
 
-  // Predict current model time and phase error
-  double pred_ms = g_clock.phase_ms + g_clock.scale * (double)(now_ms - g_clock.t0_ms);
-  double err_ms  = (double)gps_utc_ms - pred_ms;
-
-  // Slew cap (no big jumps)
-  const double SLEW_CAP_MS = 50.0;
-  if (err_ms < -SLEW_CAP_MS) err_ms = -SLEW_CAP_MS;
-  if (err_ms >  SLEW_CAP_MS) err_ms =  SLEW_CAP_MS;
-  g_clock.phase_ms += err_ms;
-
-  // Frequency refinement if ≥60 s have passed
-  static bool have_ref=false; static uint64_t ref_uptime=0, ref_gps=0;
-  if (!have_ref){ have_ref=true; ref_uptime=now_ms; ref_gps=gps_utc_ms; }
-  uint64_t du = now_ms - ref_uptime, dg = gps_utc_ms - ref_gps;
-  if (du >= 60000ULL){
-    double meas_scale = (double)dg / (double)du;      // ms/ms
-    const double A = 0.02;                            // gentle IIR
-    g_clock.scale = (1.0 - A)*g_clock.scale + A*meas_scale;
-    ref_uptime = now_ms; ref_gps = gps_utc_ms;
+static inline const char* flush_reason_u8(uint8_t r){
+  switch(r){
+    case FR_THRESHOLD: return "threshold";
+    case FR_EMERGENCY: return "emergency";
+    case FR_MAXHOLD:   return "maxhold";
+    case FR_MSC:       return "msc";
+    default:           return "manual";
   }
-
-  // Re-anchor
-  g_clock.t0_ms  = now_ms;
-  g_clock.synced = true;
-
-  // Legacy flags used by quiet mode
-  timeSynced    = true;
-  syncEventFlag = true;
-  noFlushUntilMs = millis() + QUIET_AFTER_SYNC_MS;
 }
+
+// Forward declaration so we can call from early code
+void flushBuffers(bool emergency, uint8_t reason_code);
 
 // ====================================================================
 // Unified event ring (types + storage + helpers) — dynamic capacity
@@ -214,7 +197,7 @@ static size_t    EMERG_THRESH_B  = 0;   // 87.25%
 static LogEvent g_events_fallback[FALLBACK_EVENT_MAX];
 
 // Max hold guard (forces occasional flush at very low rates)
-#define FLUSH_MAX_HOLD_MS 900000UL  // set to 0 to disable
+#define FLUSH_MAX_HOLD_MS 30000UL  // set to 0 to disable
 
 inline size_t  ring_used_bytes()   { return g_event_count * sizeof(LogEvent); }
 inline uint8_t ring_fullness_pct() { return (RING_CAP_BYTES ? (uint8_t)((ring_used_bytes() * 100U) / RING_CAP_BYTES) : 100); }
@@ -228,13 +211,11 @@ inline void note_flush_thresholds() {
   else if (usedB >= NORMAL_THRESH_B && g_flushHint < 2) g_flushHint = 1;
 }
 
-// Probe the allocator to find the largest contiguous block we can get right now.
-size_t find_max_contiguous_block(size_t max_limit = (1u<<21)) { // cap ~2 MB (>> 256 KB SRAM)
+// Probe allocator for largest contiguous block we can get now
+size_t find_max_contiguous_block(size_t max_limit = (1u<<21)) {
   size_t ok = 0;
   size_t trySize = 1024; // 1 KB start
   void* p = nullptr;
-
-  // Exponential growth until failure or limit
   while (trySize <= max_limit) {
     p = os_malloc(trySize);
     if (!p) break;
@@ -242,16 +223,14 @@ size_t find_max_contiguous_block(size_t max_limit = (1u<<21)) { // cap ~2 MB (>>
     ok = trySize;
     trySize <<= 1;
   }
-
-  // Binary search between last ok and first fail
   size_t lo = ok, hi = trySize;
-  while (hi > lo + 1024) { // 1 KB resolution
+  while (hi > lo + 1024) {
     size_t mid = lo + (hi - lo)/2;
     p = os_malloc(mid);
     if (p) { os_free(p); lo = mid; }
     else   { hi = mid; }
   }
-  return lo; // largest contiguous allocatable block (approx)
+  return lo;
 }
 
 bool push_event(const LogEvent& e){
@@ -260,7 +239,6 @@ bool push_event(const LogEvent& e){
   return true;
 }
 
-// Allocate the ring from the *current* allocatable block after init.
 void alloc_event_ring_from_heap(){
   size_t maxBlock = find_max_contiguous_block();
   const size_t reserve = 8 * 1024;                   // ~8 KB safety headroom
@@ -272,7 +250,6 @@ void alloc_event_ring_from_heap(){
   if (cap < min_events) cap = min_events;
   if (cap > max_events) cap = max_events;
 
-  // Try to allocate; back off a bit if it fails
   for (int tries = 0; tries < 6; ++tries) {
     g_events = (LogEvent*) os_malloc(cap * sizeof(LogEvent));
     if (g_events) break;
@@ -300,7 +277,50 @@ void alloc_event_ring_from_heap(){
 }
 
 // ====================================================================
-// ADXL345 (I2C)
+// GPS/NMEA globals (declare BEFORE functions that use them)
+// ====================================================================
+static const size_t NMEA_MAX=160;
+char   nmeaLine[NMEA_MAX]; size_t nmeaIdx=0; bool nmeaOverflow=false;
+bool   gpsValid=false; float gpsLat=NAN, gpsLon=NAN;
+uint32_t gpsSessionStart = 0; // used by RMC freshness check
+bool sawRmcThisSession = false;
+
+// ====================================================================
+// GNSS time discipline hook (called from parseRMC)
+// ====================================================================
+void time_on_gps_utc(int yyyy, int mo, int dd, int hh, int mi, int ss){
+  if (!plausibleYear(yyyy)) return;
+  uint64_t gps_utc_ms = unix_ms_from_ymdhms(yyyy, mo, dd, hh, mi, ss);
+  uint64_t now_ms     = uptime_ms64();
+
+  double pred_ms = g_clock.phase_ms + g_clock.scale * (double)(now_ms - g_clock.t0_ms);
+  double err_ms  = (double)gps_utc_ms - pred_ms;
+
+  const double SLEW_CAP_MS = 50.0;
+  if (err_ms < -SLEW_CAP_MS) err_ms = -SLEW_CAP_MS;
+  if (err_ms >  SLEW_CAP_MS) err_ms =  SLEW_CAP_MS;
+  g_clock.phase_ms += err_ms;
+
+  static bool have_ref=false; static uint64_t ref_uptime=0, ref_gps=0;
+  if (!have_ref){ have_ref=true; ref_uptime=now_ms; ref_gps=gps_utc_ms; }
+  uint64_t du = now_ms - ref_uptime, dg = gps_utc_ms - ref_gps;
+  if (du >= 60000ULL){
+    double meas_scale = (double)dg / (double)du;      // ms/ms
+    const double A = 0.02;
+    g_clock.scale = (1.0 - A)*g_clock.scale + A*meas_scale;
+    ref_uptime = now_ms; ref_gps = gps_utc_ms;
+  }
+
+  g_clock.t0_ms  = now_ms;
+  g_clock.synced = true;
+
+  timeSynced    = true;
+  syncEventFlag = true;
+  noFlushUntilMs = millis() + QUIET_AFTER_SYNC_MS;
+}
+
+// ====================================================================
+// ADXL345 (I2C) + FIFO helpers
 // ====================================================================
 static uint8_t ADXL_ADDR=0x1D; // auto-probe to 0x53 if needed
 bool i2cWrite8(uint8_t a,uint8_t r,uint8_t v){ Wire.beginTransmission(a); Wire.write(r); Wire.write(v); return Wire.endTransmission()==0; }
@@ -312,94 +332,75 @@ bool i2cReadBytes(uint8_t a,uint8_t r,uint8_t* b,size_t n){
   return got==n;
 }
 uint8_t i2cRead8(uint8_t a,uint8_t r){ uint8_t v=0; i2cReadBytes(a,r,&v,1); return v; }
+
 bool adxl_init(){
   uint8_t id=i2cRead8(ADXL_ADDR,0x00);
   if(id!=0xE5){ ADXL_ADDR=(ADXL_ADDR==0x1D)?0x53:0x1D; id=i2cRead8(ADXL_ADDR,0x00); if(id!=0xE5) return false; }
-  i2cWrite8(ADXL_ADDR,0x2C,0x17); // LOW_POWER=1, rate=12.5Hz
-  i2cWrite8(ADXL_ADDR,0x31,0x00); // ±2g, 10-bit
-  i2cWrite8(ADXL_ADDR,0x2D,0x08); // MEASURE=1
+
+  // 12.5 Hz, LOW_POWER=1
+  i2cWrite8(ADXL_ADDR,0x2C,0x17); // BW_RATE
+  i2cWrite8(ADXL_ADDR,0x31,0x00); // DATA_FORMAT: ±2g, 10-bit
+  i2cWrite8(ADXL_ADDR,0x2D,0x08); // POWER_CTL: MEASURE=1
+
+  // FIFO stream mode + watermark
+  uint8_t wm = (ACCEL_FIFO_WATERMARK < 1) ? 1 : (ACCEL_FIFO_WATERMARK > 32 ? 32 : ACCEL_FIFO_WATERMARK);
+  i2cWrite8(ADXL_ADDR, 0x38, (0b10<<6) | (wm & 0x1F));  // FIFO_CTL: STREAM + watermark
+
+#if ACCEL_USE_FIFO_INT
+  // Enable WATERMARK on INT1 (active high, push-pull default)
+  i2cWrite8(ADXL_ADDR, 0x2E, 0x02);   // INT_ENABLE: WATERMARK
+  i2cWrite8(ADXL_ADDR, 0x2F, 0x00);   // INT_MAP: WATERMARK -> INT1
+#else
+  // Polling mode: no interrupts
+  i2cWrite8(ADXL_ADDR, 0x2E, 0x00);   // INT_ENABLE: none
+#endif
+
+  (void)i2cRead8(ADXL_ADDR, 0x30);    // Clear any latched INT_SOURCE
   return true;
 }
-bool adxl_read(int16_t &x,int16_t &y,int16_t &z){
-  uint8_t b[6]; if(!i2cReadBytes(ADXL_ADDR,0x32,b,6)) return false;
-  x=(int16_t)(b[1]<<8|b[0]); y=(int16_t)(b[3]<<8|b[2]); z=(int16_t)(b[5]<<8|b[4]); return true;
-}
+
 inline float to_g(int16_t c){ return c*0.0039f; }
 
-// ====================================================================
-// NMEA (RMC) parsing
-// ====================================================================
-static const size_t NMEA_MAX=160;
-char   nmeaLine[NMEA_MAX]; size_t nmeaIdx=0; bool nmeaOverflow=false;
-bool   gpsValid=false; float gpsLat=NAN, gpsLon=NAN;
-uint32_t gpsSessionStart = 0; // used by RMC freshness check
-bool sawRmcThisSession = false;
+#if ACCEL_USE_FIFO_INT
+volatile bool g_accelIntFlag = false;
+void accel_isr(){ g_accelIntFlag = true; }
+#endif
 
-static inline int hexval(char h){
-  if(h>='0' && h<='9') return h-'0';
-  h = toupper((unsigned char)h);
-  if(h>='A' && h<='F') return h-'A'+10;
-  return -1;
-}
-bool nmeaChecksumOk(const char* s){
-  const char* star = strrchr(s, '*');
-  if(!s || s[0] != '$' || !star || star[1] == 0 || star[2] == 0) return false;
-  uint8_t cs=0;
-  for(const char* p=s+1; p<star; ++p) cs ^= (uint8_t)(*p);
-  int want = (hexval(star[1])<<4) | hexval(star[2]);
-  return want>=0 && cs == (uint8_t)want;
-}
-float nmeaCoord(const char* ddmm){
-  if(!ddmm||!*ddmm) return NAN;
-  const char* dot=strchr(ddmm,'.'); if(!dot) return NAN;
-  int degDigits=((dot-ddmm)>4)?3:2; char db[4]={0}; strncpy(db,ddmm,degDigits);
-  int deg=atoi(db); float mins=atof(ddmm+degDigits);
-  return deg + mins / 60.0f;
-}
-void parseRMC(char* s){
-  // $--RMC,time,status,lat,NS,lon,EW,speed,cog,date,...
-  char* p=strchr(s,','); if(!p) return; *p++=0; char* timestr=p;
-  p=strchr(p,','); if(!p) return; *p++=0; char* status=p;
-  p=strchr(p,','); if(!p) return; *p++=0; char* latF=p;
-  p=strchr(p,','); if(!p) return; *p++=0; char* ns=p;
-  p=strchr(p,','); if(!p) return; *p++=0; char* lonF=p;
-  p=strchr(p,','); if(!p) return; *p++=0; char* ew=p;
-  p=strchr(p,','); if(!p) return; *p++=0; p=strchr(p,','); if(!p) return; *p++=0; char* datestr=p;
+// Read up to 32 samples from FIFO in one I2C burst; timestamp evenly at ODR.
+void service_accel_fifo(){
+  (void)i2cRead8(ADXL_ADDR, 0x30); // Ack/clear latched source (harmless in polling)
 
-  bool valid = (*status=='A');
-  float lat = nmeaCoord(latF), lon = nmeaCoord(lonF);
-  if(ns&&*ns=='S') lat=-lat; if(ew&&*ew=='W') lon=-lon;
+  uint8_t fifo_status = i2cRead8(ADXL_ADDR, 0x39);
+  uint8_t n = fifo_status & 0x3F;          // 0..32
+  if (n == 0) return;
+  if (n > 32) n = 32;
 
-  if(valid && !isnan(lat) && !isnan(lon)){
-    gpsValid = true; gpsLat = lat; gpsLon = lon; lastValidRmcMs = millis();
-    if (lastValidRmcMs >= gpsSessionStart) sawRmcThisSession = true;
+  const uint16_t bytes = 6 * n;
+  uint8_t buf[6*32];
+  if (!i2cReadBytes(ADXL_ADDR, 0x32, buf, bytes)) return;
 
-    int hh=0,mi=0,ss=0,dd=1,mo=1,yy=0;
-    if(timestr && strlen(timestr)>=6){ hh=(timestr[0]-'0')*10+(timestr[1]-'0'); mi=(timestr[2]-'0')*10+(timestr[3]-'0'); ss=(timestr[4]-'0')*10+(timestr[5]-'0'); }
-    if(datestr && strlen(datestr)>=6){ dd=(datestr[0]-'0')*10+(datestr[1]-'0'); mo=(datestr[2]-'0')*10+(datestr[3]-'0'); yy=(datestr[4]-'0')*10+(datestr[5]-'0'); }
-    int yyyy = fullYearFromYY(yy);
+  const uint32_t period = ACCEL_PERIOD_MS;
+  const uint32_t now_ms = millis();
+  const uint32_t first_ts = now_ms - (uint32_t)(n-1)*period;
 
-    time_on_gps_utc(yyyy, mo, dd, hh, mi, ss); // discipline clock
-  } else {
-    gpsValid = false;
+  for (uint8_t i = 0; i < n; i++){
+    const uint8_t* b = &buf[6*i];
+    int16_t x = (int16_t)(b[1]<<8 | b[0]);
+    int16_t y = (int16_t)(b[3]<<8 | b[2]);
+    int16_t z = (int16_t)(b[5]<<8 | b[4]);
+
+    LogEvent e; e.type = EV_ACCEL;
+    e.p.accel.t_ms   = first_ts + (uint32_t)i*period;
+    e.p.accel.unix_s = utc_time_valid() ? utc_now_s() : 0;
+    e.p.accel.ax     = to_g(x);
+    e.p.accel.ay     = to_g(y);
+    e.p.accel.az     = to_g(z);
+
+    if (!push_event(e)) { flushBuffers(true, FR_EMERGENCY); (void)push_event(e); }
+    else { note_flush_thresholds(); }
   }
-}
-void pumpGPS(){
-  while(Serial1.available()){
-    int c=Serial1.read(); if(c<0) break; if(c=='\r') continue;
-    if(c=='\n'){
-      if(!nmeaOverflow){
-        nmeaLine[min(nmeaIdx,NMEA_MAX-1)] = '\0';
-        if (nmeaLine[0]=='$' && strstr(nmeaLine, "RMC") && nmeaChecksumOk(nmeaLine)){
-          parseRMC(nmeaLine);
-        }
-      }
-      nmeaIdx=0; nmeaOverflow=false;
-    } else {
-      if(nmeaIdx < NMEA_MAX-2) nmeaLine[nmeaIdx++] = (char)c;
-      else nmeaOverflow = true; // discard this sentence until newline
-    }
-  }
+
+  // Optional: if (n == 32) Serial.println("[ACCEL] FIFO full at read (possible drops)");
 }
 
 // ====================================================================
@@ -448,8 +449,6 @@ uint32_t bleStartMs = 0;
 uint32_t lastBleCycleStartMs = 0;
 
 // Forward decl for flush used in callback
-void flushBuffers(bool emergency);
-
 void startBleScan();
 void stopBleScan();
 
@@ -472,7 +471,7 @@ void scan_callback(ble_gap_evt_adv_report_t* report)
     memcpy(e.p.ble.mac, report->peer_addr.addr, 6);
     e.p.ble.rssi   = report->rssi;
 
-    if (!push_event(e)){ flushBuffers(true); (void)push_event(e); }
+    if (!push_event(e)){ flushBuffers(true, FR_EMERGENCY); (void)push_event(e); }
     else { note_flush_thresholds(); }
   }
   Bluefruit.Scanner.resume();
@@ -495,14 +494,13 @@ void stopBleScan() {
 }
 
 // ====================================================================
-// GPS scheduler + flush logic
+// SD flush timing + helpers
 // ====================================================================
 bool     gpsSessionActive = false;
 uint32_t lastGpsSampleMs  = 0;
 uint32_t acqDeadline      = 0;
 bool     retryUsed        = false;
 
-// SD flush timing
 uint32_t lastFlushMs = 0;
 
 bool inQuietMode(){
@@ -512,16 +510,17 @@ bool inQuietMode(){
   return acquiring || justSynced;
 }
 
-void flushBuffers(bool emergency){
+void flushBuffers(bool emergency, uint8_t reason_code){
   if(!sdOK) return;
   if(!emergency && inQuietMode()) return;
 
-  // Stats
+
   size_t n_acc = 0, n_gps = 0, n_ble = 0;
+  static size_t acc_total = 0, gps_total = 0, ble_total = 0;
+
   size_t beforeBytes = ring_used_bytes();
   uint32_t t0 = millis();
 
-  // Write all pending events to their files
   for(size_t i=0;i<g_event_count;i++){
     const LogEvent& ev = g_events[i];
     switch(ev.type){
@@ -537,7 +536,6 @@ void flushBuffers(bool emergency){
           n_acc++;
         }
       } break;
-
       case EV_GPS: {
         const auto& r = ev.p.gps;
         if(gpsFile){
@@ -553,7 +551,6 @@ void flushBuffers(bool emergency){
           n_gps++;
         }
       } break;
-
       case EV_BLE: {
         const auto& r = ev.p.ble;
         if(bleFile){
@@ -569,7 +566,6 @@ void flushBuffers(bool emergency){
     }
   }
 
-  // Flush files
   if (accelFile) accelFile.flush();
   if (gpsFile)   gpsFile.flush();
   if (bleFile)   bleFile.flush();
@@ -577,20 +573,24 @@ void flushBuffers(bool emergency){
   g_event_count = 0;
   lastFlushMs   = millis();
 
-  // Report
+  acc_total += n_acc; gps_total += n_gps; ble_total += n_ble;
+
   uint32_t dt = lastFlushMs - t0;
   Serial.print("[FLUSH] ");
   Serial.print(emergency ? "EMERGENCY" : "normal");
+  Serial.print(" reason="); Serial.print(flush_reason_u8(reason_code));
   Serial.print(" wrote A="); Serial.print(n_acc);
   Serial.print(" G=");       Serial.print(n_gps);
   Serial.print(" B=");       Serial.print(n_ble);
   Serial.print(" total=");   Serial.print(n_acc + n_gps + n_ble);
+  Serial.print(" cum=(");    Serial.print(acc_total); Serial.print(',');
+                           Serial.print(gps_total); Serial.print(',');
+                           Serial.print(ble_total); Serial.print(')');
   Serial.print(" bytes_before="); Serial.print((unsigned long)beforeBytes);
   Serial.print(" pct_before=");
   Serial.print(RING_CAP_BYTES ? (int)((beforeBytes * 100U) / RING_CAP_BYTES) : 0);
   Serial.print("% dt_ms=");  Serial.println((int)dt);
 }
-
 
 // ====================================================================
 // Serial command parser + MSC callbacks
@@ -636,7 +636,7 @@ void setMSC(bool on){
   if (on) {
     Serial.println("MSC ON: stopping logging, flushing & closing files…");
     stopBleScan();
-    flushBuffers(true);
+    flushBuffers(true, FR_MSC);
     if (accelFile) accelFile.close();
     if (gpsFile)   gpsFile.close();
     if (bleFile)   bleFile.close();
@@ -670,7 +670,6 @@ void setMSC(bool on){
     if (bleFile   && bleFile.fileSize()==0)   bleFile.println("t_ms,unix_s,mac,rssi");
     mscMode = false;
 
-    // Kick BLE/GPS schedules so they start soon
     lastBleCycleStartMs = millis() - BLE_CYCLE_PERIOD_MS;
     lastGpsSampleMs     = millis() - GPS_SAMPLE_PERIOD_MS;
   }
@@ -712,6 +711,77 @@ void handleSerialCommands(){
 }
 
 // ====================================================================
+// NMEA parsing + pump (placed AFTER globals so users are declared)
+// ====================================================================
+static inline int hexval(char h){
+  if(h>='0' && h<='9') return h-'0';
+  h = toupper((unsigned char)h);
+  if(h>='A' && h<='F') return h-'A'+10;
+  return -1;
+}
+bool nmeaChecksumOk(const char* s){
+  const char* star = strrchr(s, '*');
+  if(!s || s[0] != '$' || !star || star[1] == 0 || star[2] == 0) return false;
+  uint8_t cs=0;
+  for(const char* p=s+1; p<star; ++p) cs ^= (uint8_t)(*p);
+  int want = (hexval(star[1])<<4) | hexval(star[2]);
+  return want>=0 && cs == (uint8_t)want;
+}
+float nmeaCoord(const char* ddmm){
+  if(!ddmm||!*ddmm) return NAN;
+  const char* dot=strchr(ddmm,'.'); if(!dot) return NAN;
+  int degDigits=((dot-ddmm)>4)?3:2; char db[4]={0}; strncpy(db,ddmm,degDigits);
+  int deg=atoi(db); float mins=atof(ddmm+degDigits);
+  return deg + mins / 60.0f;
+}
+int  fullYearFromYY(int yy); // already defined above
+void parseRMC(char* s){
+  // $--RMC,time,status,lat,NS,lon,EW,speed,cog,date,...
+  char* p=strchr(s,','); if(!p) return; *p++=0; char* timestr=p;
+  p=strchr(p,','); if(!p) return; *p++=0; char* status=p;
+  p=strchr(p,','); if(!p) return; *p++=0; char* latF=p;
+  p=strchr(p,','); if(!p) return; *p++=0; char* ns=p;
+  p=strchr(p,','); if(!p) return; *p++=0; char* lonF=p;
+  p=strchr(p,','); if(!p) return; *p++=0; char* ew=p;
+  p=strchr(p,','); if(!p) return; *p++=0; p=strchr(p,','); if(!p) return; *p++=0; char* datestr=p;
+
+  bool valid = (*status=='A');
+  float lat = nmeaCoord(latF), lon = nmeaCoord(lonF);
+  if(ns&&*ns=='S') lat=-lat; if(ew&&*ew=='W') lon=-lon;
+
+  if(valid && !isnan(lat) && !isnan(lon)){
+    gpsValid = true; gpsLat = lat; gpsLon = lon; lastValidRmcMs = millis();
+    if (lastValidRmcMs >= gpsSessionStart) sawRmcThisSession = true;
+
+    int hh=0,mi=0,ss=0,dd=1,mo=1,yy=0;
+    if(timestr && strlen(timestr)>=6){ hh=(timestr[0]-'0')*10+(timestr[1]-'0'); mi=(timestr[2]-'0')*10+(timestr[3]-'0'); ss=(timestr[4]-'0')*10+(timestr[5]-'0'); }
+    if(datestr && strlen(datestr)>=6){ dd=(datestr[0]-'0')*10+(datestr[1]-'0'); mo=(datestr[2]-'0')*10+(datestr[3]-'0'); yy=(datestr[4]-'0')*10+(datestr[5]-'0'); }
+    int yyyy = fullYearFromYY(yy);
+
+    time_on_gps_utc(yyyy, mo, dd, hh, mi, ss); // discipline clock
+  } else {
+    gpsValid = false;
+  }
+}
+void pumpGPS(){
+  while(Serial1.available()){
+    int c=Serial1.read(); if(c<0) break; if(c=='\r') continue;
+    if(c=='\n'){
+      if(!nmeaOverflow){
+        nmeaLine[min(nmeaIdx,NMEA_MAX-1)] = '\0';
+        if (nmeaLine[0]=='$' && strstr(nmeaLine, "RMC") && nmeaChecksumOk(nmeaLine)){
+          parseRMC(nmeaLine);
+        }
+      }
+      nmeaIdx=0; nmeaOverflow=false;
+    } else {
+      if(nmeaIdx < NMEA_MAX-2) nmeaLine[nmeaIdx++] = (char)c;
+      else nmeaOverflow = true; // discard this sentence until newline
+    }
+  }
+}
+
+// ====================================================================
 //
 // Low-power sleep helper, Setup, Loop
 //
@@ -723,17 +793,28 @@ static inline void lowPowerIdleUntil(uint32_t deadline_ms){
   }
 }
 
+#if !ACCEL_USE_FIFO_INT
+static uint32_t g_accel_poll_period_ms = 750; // computed in setup()
+static uint32_t nextAccelPollDue = 0;
+#endif
+
 void setup(){
   Serial.begin(USB_BAUD);
   uint32_t t0=millis(); while(!Serial && millis()-t0<2000){} // brief wait
-  Serial.println("\n=== Logger + MSC + BLE + GPS duty-cycle + low-power ===");
+  Serial.println("\n=== Logger + MSC + BLE + GPS duty-cycle + low-power (ADXL FIFO polling) ===");
 
   Wire.begin();
+  Wire.setClock(400000); // faster I2C for burst FIFO reads
   Serial1.begin(GPS_BAUD);
 
   // ADXL345
   if(!adxl_init()) Serial.println("ADXL345 not found");
-  else Serial.println("ADXL345 @ 12.5 Hz (low-power) OK");
+  else Serial.println("ADXL345 @ 12.5 Hz (low-power, FIFO STREAM) OK");
+
+#if ACCEL_USE_FIFO_INT
+  pinMode(ACCEL_INT_PIN, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(ACCEL_INT_PIN), accel_isr, RISING);
+#endif
 
   // --- SD first ---
   Serial.print("Init SD @ 12 MHz… ");
@@ -779,6 +860,16 @@ void setup(){
   // Allocate the unified ring from the allocator's current limit after init
   alloc_event_ring_from_heap();
 
+#if !ACCEL_USE_FIFO_INT
+  // Compute a safe poll period from ODR & watermark:
+  const uint32_t wm_interval = (uint32_t)ACCEL_FIFO_WATERMARK * ACCEL_PERIOD_MS;           // time to reach WM
+  const uint32_t slack       = (uint32_t)(32 - ACCEL_FIFO_WATERMARK) * ACCEL_PERIOD_MS;    // time from WM to overrun
+  g_accel_poll_period_ms = (slack > 0) ? min(wm_interval/2, (slack*8)/10) : wm_interval/2; // conservative
+  if (g_accel_poll_period_ms < 50) g_accel_poll_period_ms = 50;
+  nextAccelPollDue = millis() + g_accel_poll_period_ms;
+  Serial.print("ACCEL poll period = "); Serial.print(g_accel_poll_period_ms); Serial.println(" ms");
+#endif
+
   // LEDs off
   pinMode(LED_BUILTIN, OUTPUT);
   digitalWrite(LED_BUILTIN, LOW);
@@ -817,10 +908,10 @@ void loop(){
 
   // --- Service per-push flush hints ASAP (event-driven, low power) ---
   if (g_flushHint == 2) {                // emergency
-    flushBuffers(true);
+    flushBuffers(true, FR_EMERGENCY);
     g_flushHint = 0;
-  } else if (g_flushHint == 1) {         // normal
-    if (!inQuietMode()) flushBuffers(false);
+  } else if (g_flushHint == 1) {         // threshold
+    if (!inQuietMode()) flushBuffers(false, FR_THRESHOLD);
     g_flushHint = 0;
   }
 
@@ -853,7 +944,7 @@ void loop(){
       e.p.gps.fix    = 1;
       e.p.gps.sync   = (syncEventFlag ? 1 : 0);
 
-      if (!push_event(e)){ flushBuffers(true); (void)push_event(e); }
+      if (!push_event(e)){ flushBuffers(true, FR_EMERGENCY); (void)push_event(e); }
       else { note_flush_thresholds(); }
 
       syncEventFlag   = false;
@@ -874,7 +965,7 @@ void loop(){
         e.p.gps.fix    = 0;
         e.p.gps.sync   = 0;
 
-        if (!push_event(e)){ flushBuffers(true); (void)push_event(e); }
+        if (!push_event(e)){ flushBuffers(true, FR_EMERGENCY); (void)push_event(e); }
         else { note_flush_thresholds(); }
 
         stopGpsSession();
@@ -883,36 +974,35 @@ void loop(){
     }
   }
 
-  // ----- Accel @ ~12.5 Hz → EV_ACCEL -----
-  static uint32_t nextAccelDue = 0;
-  if (now >= nextAccelDue){
-    nextAccelDue = now + ACCEL_PERIOD_MS;
-    int16_t x,y,z;
-    if(adxl_read(x,y,z)){
-      LogEvent e; e.type = EV_ACCEL;
-      e.p.accel.t_ms   = (uint32_t)millis();
-      e.p.accel.unix_s = utc_time_valid() ? utc_now_s() : 0;
-      e.p.accel.ax     = to_g(x);
-      e.p.accel.ay     = to_g(y);
-      e.p.accel.az     = to_g(z);
-
-      if (!push_event(e)){ flushBuffers(true); (void)push_event(e); }
-      else { note_flush_thresholds(); }
-    }
+  // ----- ADXL345 FIFO polling (no INT pin) -----
+#if !ACCEL_USE_FIFO_INT
+  if ((int32_t)(now - nextAccelPollDue) >= 0){
+    nextAccelPollDue = now + g_accel_poll_period_ms;
+    service_accel_fifo();  // drain all queued samples in one burst
   }
+#else
+  // If/when you wire the INT pin:
+  if (g_accelIntFlag){
+    g_accelIntFlag = false;
+    service_accel_fifo();
+  }
+#endif
 
-  // ----- Time-based guard (optional; keeps data moving at very low rates) -----
+  // ----- Time-based guard (keeps data moving at very low rates) -----
   if (sdOK && RING_CAP_BYTES){
     bool needTime = (FLUSH_MAX_HOLD_MS>0) && (now - lastFlushMs >= FLUSH_MAX_HOLD_MS) && (!inQuietMode());
-    if (needTime) flushBuffers(false);
+    if (needTime) flushBuffers(false, FR_MAXHOLD);
   }
 
-  // ----- Low-power sleep until the next interesting moment (no periodic fullness wake) -----
+  // ----- Low-power sleep until the next interesting moment -----
   uint32_t nextBle = bleActive ? (bleStartMs + BLE_ACTIVE_MS) : (lastBleCycleStartMs + BLE_CYCLE_PERIOD_MS);
   uint32_t nextGps = gpsSessionActive
                      ? min(gpsSessionStart + GPS_WARMUP_MS, acqDeadline)
                      : (lastGpsSampleMs + GPS_SAMPLE_PERIOD_MS);
-  uint32_t deadline = min3(nextAccelDue, nextBle, nextGps);
+  uint32_t deadline = min(nextBle, nextGps);
+#if !ACCEL_USE_FIFO_INT
+  deadline = min(deadline, nextAccelPollDue);
+#endif
 
   if ((int32_t)(deadline - now) > 0) lowPowerIdleUntil(deadline);
   else sd_app_evt_wait();
