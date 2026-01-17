@@ -1,1048 +1,958 @@
-// Forward declaration so Arduino's auto-prototypes know the type used in push_event()
-struct LogEvent;
+/*
+  Logger (ACC + GPS + BLE) with:
+  - ACC paced by NRF_TIMER1 (stable 12.5 Hz)
+  - GPS NON-BLOCKING state machine (bounded per-loop time)
+  - GPS "backup sleep" when not busy (UBX-RXM-PMREQ flags=0x02)  <-- this was your “4th mode”
+  - BLE scan windows (10s every 60s by default), continues during GPS attempts
+  - SD flush: threshold-first + emerg + failsafe, but flush is BURSTED (bounded events per loop)
+  - Policy: block SD flush while gps_busy==1 except EMERG; FAILSAFE waits for GPS
+  - CPU sleep-when-idle via sd_app_evt_wait() (SoftDevice)
 
-// ItsyBitsy nRF52840 logger + USB MSC + BLE scanner + GPS duty cycle + low-power
-// - ADXL345 @ 12.5 Hz (I2C, low-power mode), FIFO STREAM + polling (no INT pin)
-// - GPS: wake -> wait -> log 1 row -> standby (every 3 minutes, UBX RXM-PMREQ standby/wake)
-// - BLE: passive scan to /BLE.CSV with per-window de-dup (MAC+RSSI)
-// - Unified event ring buffer sized at runtime from allocatable heap after init
-//   • Normal flush at 85% of that capacity; emergency at 87.25%
-//   • Event-driven flush hints set on each push; SD writes only from loop() (low power)
-// - Disciplined UTC clock + 64-bit uptime; events stamped at CAPTURE time
-// - USB command: "MSC ON" / "MSC OFF" to expose/hide SD as a USB drive
-//
-// Serial Monitor: 115200
+  IMPORTANT:
+  - Debug printing is gated behind CFG.debug_enable.
+    If debug_enable=false, USB Serial is NOT started and status printing is effectively off.
+*/
 
+#include <Arduino.h>
+#include <stdint.h>
 #include <Wire.h>
 #include <SPI.h>
 #include <SdFat.h>
-#include <Adafruit_TinyUSB.h>   // TinyUSB (Serial + MSC)
-#include <bluefruit.h>          // Adafruit nRF52 Bluefruit (central scan)
-#include <string.h>
-#include <ctype.h>
-#include <math.h>
+#include <bluefruit.h>
 
-#if defined(NRF52_SERIES)
-  // Use FreeRTOS allocators if present
-  #include <FreeRTOS.h>
-  #include <task.h>
-  extern "C" void* pvPortMalloc(size_t);
-  extern "C" void  vPortFree(void*);
-  #define os_malloc pvPortMalloc
-  #define os_free   vPortFree
-#else
-  #include <stdlib.h>
-  #define os_malloc malloc
-  #define os_free   free
+#if defined(SOFTDEVICE_PRESENT)
+  #include <nrf_soc.h>   // sd_app_evt_wait()
 #endif
 
-// ---------------- SD (SdFs/FsFile) ----------------
-// We DO NOT keep files open; they are opened only inside a flush "session".
-const uint8_t SD_CS_PIN = 10;
-SdFs sd;
-SdSpiConfig sdCfg(SD_CS_PIN, DEDICATED_SPI, SD_SCK_MHZ(12));
-FsFile accelFile, gpsFile, bleFile;     // used only during a session
-const char* ACCEL_FILE = "/ACCEL.CSV";
-const char* GPS_FILE   = "/GPS.CSV";
-const char* BLE_FILE   = "/BLE.CSV";
+// ===============================
+// CONFIG
+// ===============================
+struct Config {
+  // Ring
+  float    ring_alloc_fraction_of_free_heap = 0.50f;
+  float    ring_normal_threshold_fraction   = 0.75f;
+  float    ring_emerg_threshold_fraction    = 0.85f;
 
-bool sdOK       = false;   // last mount result
-bool sdBusAwake = false;   // SPI bus active state
+  // Status / failsafe
+  uint32_t status_print_ms   = 1000;
+  uint32_t flush_failsafe_ms = 900000; // 15 min since last SUCCESSFUL flush
 
-// ---------------- USB MSC -------------------------
-Adafruit_USBD_MSC usb_msc;
-volatile bool mscReady = false;     // host can read/write when true
-bool mscMode  = false;              // user-controlled mode
+  // SD
+  uint8_t  sd_cs_pin = 10;
+  uint32_t sd_spi_hz = 12000000;
 
-// ---------------- Rates & policy ------------------
-#define USB_BAUD              115200
-#define GPS_BAUD              9600
-#define ACCEL_PERIOD_MS       80        // ~12.5 Hz
+  // GPS
+  bool     gps_enabled      = true;
+  uint32_t gps_interval_ms  = 180000;  // 3 min
+  uint32_t gps_timeout_ms   = 15000;   // attempt duration
+  uint32_t gps_baud         = 9600;
+  uint8_t  gps_min_sats     = 4;
+  float    gps_min_hdop     = 2.5f;
 
-// Quiet mode windows
-#define QUIET_AFTER_SYNC_MS   400UL     // keep SPI quiet briefly after sync
-#define FIX_LOSS_GRACE_MS     3000UL    // no valid RMC seen for this long → acquiring
+  // GPS deep sleep (the working low-power mode you found)
+  bool     gps_backup_sleep_enabled = true;
 
-// ---------------- GPS duty cycle (editable) ---------------
-#define GPS_SAMPLE_PERIOD_MS  180000UL  // 3 minutes between logged fixes
-#define GPS_WARMUP_MS         8000UL    // time after wake before accepting fix
-#define GPS_FIX_TIMEOUT_MS    10000UL   // main acquisition window
-#define GPS_RETRY_MS          2000UL    // one extra bite if we’d otherwise log NaN
+  // BLE
+  bool     ble_log_enabled      = true;
+  uint32_t ble_period_ms        = 60000;
+  uint32_t ble_window_ms        = 10000;
+  bool     ble_dedup_per_window = true;
+  uint16_t ble_dedup_max_macs   = 128;
+  int8_t   ble_tx_power_dbm     = 0;
 
-// ---------------- BLE scan schedule (editable) -------------
-#define BLE_CYCLE_PERIOD_MS   60000UL   // total cycle length
-#define BLE_ACTIVE_MS         5000UL    // scan length within cycle
+  // NEW: BLE scan duty within the scan window
+  // - Scanner params are set as:
+  //     interval = ble_scan_interval_ms
+  //     window   = interval * ble_scan_duty
+  // - This does NOT change ble_period_ms / ble_window_ms scheduling.
+  float    ble_scan_duty        = 0.10f;  // 0.05 to 1.0 is a sensible test range
+  uint32_t ble_scan_interval_ms = 100;    // was effectively 100ms (160 * 0.625ms)
 
-// BLE scan duty cycle (scan window / interval). 50% by default.
-#define BLE_SCAN_INTERVAL_MS  100
-#define BLE_SCAN_WINDOW_MS    50
+  // ACC
+  bool     acc_enabled  = true;
+  float    acc_odr_hz   = 12.5f;
+  uint8_t  acc_range_g  = 16;
 
-// BLE de-duplication toggle: 1 = log each MAC once per scan window; 0 = log every advert
-#define BLE_DEDUP_PER_WINDOW  1
+  // Loop budgets (this is the key to keeping BLE stable)
+  uint32_t gps_poll_time_budget_us   = 1200; // max time per loop for GPS parsing
+  uint32_t gps_poll_byte_budget      = 96;   // also cap bytes
+  uint32_t sd_flush_max_events_burst = 200;  // max events written per loop during flush
+  uint32_t acc_max_catchup_per_loop  = 3;    // cap ACC catch-up to keep loop responsive
 
-// ---- ADXL345 FIFO config (no interrupt pin yet) ----
-#define ACCEL_USE_FIFO_INT      0          // 0 = poll FIFO; 1 = use INT pin later
-#define ACCEL_FIFO_WATERMARK    24         // 1..32; 24 is a good sweet spot at 12.5 Hz
-#define ACCEL_INT_PIN           9          // used only if ACCEL_USE_FIFO_INT == 1
-
-#if BLE_DEDUP_PER_WINDOW
-  #define BLE_SEEN_MAX 256
-  static uint8_t bleSeen[BLE_SEEN_MAX][6];   // MACs (little-endian as reported)
-  static size_t  bleSeenCount = 0;
-  static inline bool should_log_and_remember(const uint8_t macLE[6]){
-    for (size_t i = 0; i < bleSeenCount; i++){
-      if (memcmp(bleSeen[i], macLE, 6) == 0) return false;
-    }
-    if (bleSeenCount < BLE_SEEN_MAX){
-      memcpy(bleSeen[bleSeenCount++], macLE, 6);
-    }
-    return true;
-  }
-#endif
-
-// ====================================================================
-// 64-bit monotonic uptime
-// ====================================================================
-uint64_t uptime_ms64(){
-  static uint32_t prev32 = 0;
-  static uint64_t high   = 0;
-  uint32_t now32 = millis();
-  if (now32 < prev32) high += (1ULL << 32); // wrap
-  prev32 = now32;
-  return high | now32;
-}
-
-// ====================================================================
-// Disciplined UTC clock (UTC in ms) + helpers
-// ====================================================================
-struct ClockDisc {
-  double   scale    = 1.0;   // ms/ms (ppm correction)
-  double   phase_ms = 0.0;   // UTC ms at t0_ms
-  uint64_t t0_ms    = 0;     // uptime anchor (ms)
-  bool     synced   = false; // received at least one valid GPS UTC
+  // Debug
+  bool     debug_enable         = false; // master debug switch (USB Serial on/off)
+  bool     debug_print_gps_fix  = false; // keep off to avoid serial stalls
 };
-ClockDisc g_clock;
 
-uint64_t utc_now_ms(){
-  if (!g_clock.synced) return 0;
-  uint64_t now_ms = uptime_ms64();
-  double dt = (double)(now_ms - g_clock.t0_ms);
-  double t_ms = g_clock.phase_ms + g_clock.scale * dt;
-  if (t_ms < 0) t_ms = 0;
-  return (uint64_t)(t_ms + 0.5);
+static Config CFG;
+
+// ===============================
+// SD
+// ===============================
+SdFat sd;
+SdFile fAcc, fGps, fBle;
+static bool sd_ok = false;
+
+// ===============================
+// Ring buffer TLV
+// ===============================
+enum EvType : uint8_t { EVT_ACC = 1, EVT_GPS = 2, EVT_BLE = 3 };
+enum FlushWhy : uint8_t { FLUSH_NORMAL = 1, FLUSH_EMERG = 2, FLUSH_FAILSAFE = 3 };
+
+struct Ring {
+  uint8_t*  buf = nullptr;
+  uint32_t  cap = 0;
+  uint32_t  head = 0;
+  uint32_t  tail = 0;
+  uint32_t  used = 0;
+  uint32_t  drops = 0;
+  uint32_t  normal_th = 0;
+  uint32_t  emerg_th  = 0;
+};
+
+static Ring RB;
+
+extern "C" char* sbrk(int);
+static uint32_t approx_free_heap_bytes() {
+  char stack_dummy;
+  char* heap_end = sbrk(0);
+  return (uint32_t)(&stack_dummy - heap_end);
 }
-uint32_t utc_now_s(){ return (uint32_t)(utc_now_ms() / 1000ULL); }
-uint16_t utc_now_ms_of_sec(){ return (uint16_t)(utc_now_ms() % 1000ULL); }
-bool     utc_time_valid(){ return g_clock.synced; }
+static inline uint32_t rb_free() { return RB.cap - RB.used; }
 
-// Y/M/D → UNIX ms
-static const int mdays[12]={31,28,31,30,31,30,31,31,30,31,30,31};
-bool isLeap(int y){ return (y%4==0 && y%100!=0) || (y%400==0); }
-int  fullYearFromYY(int yy){ return 2000 + (yy%100); }
-uint32_t daysSince1970(int y,int m,int d){
-  uint32_t days=0; for(int yr=1970; yr<y; ++yr) days += isLeap(yr)?366:365;
-  for(int i=1;i<m;i++){ days += mdays[i-1]; if(i==2 && isLeap(y)) days++; }
-  return days + (d-1);
+static inline void rb_write_u8(uint8_t v) {
+  RB.buf[RB.head] = v;
+  RB.head = (RB.head + 1) % RB.cap;
+  RB.used++;
 }
-uint64_t unix_ms_from_ymdhms(int y,int m,int d,int hh,int mm,int ss){
-  return ((uint64_t)daysSince1970(y,m,d)*86400ULL + (uint64_t)hh*3600ULL + (uint64_t)mm*60ULL + (uint64_t)ss) * 1000ULL;
-}
-static inline bool plausibleYear(int yyyy){ return (yyyy >= 2020 && yyyy <= 2035); }
-
-// Legacy/acquire flags still used
-bool     timeSynced     = false;
-bool     syncEventFlag  = false;
-uint32_t lastValidRmcMs = 0;
-uint32_t noFlushUntilMs = 0;
-
-// ------------------ Flush reasons (declare EARLY) --------------------
-enum FlushReason : uint8_t { FR_THRESHOLD=0, FR_EMERGENCY=1, FR_MAXHOLD=2, FR_MSC=3, FR_MANUAL=4 };
-
-static inline const char* flush_reason_u8(uint8_t r){
-  switch(r){
-    case FR_THRESHOLD: return "threshold";
-    case FR_EMERGENCY: return "emergency";
-    case FR_MAXHOLD:   return "maxhold";
-    case FR_MSC:       return "msc";
-    default:           return "manual";
-  }
-}
-
-// Forward declaration so we can call from early code
-void flushBuffers(bool emergency, uint8_t reason_code);
-
-// ====================================================================
-// Unified event ring (types + storage + helpers) — dynamic capacity
-// ====================================================================
-enum EventType : uint8_t { EV_ACCEL=1, EV_GPS=2, EV_BLE=3 };
-
-struct AccelRow { uint32_t t_ms; uint32_t unix_s; float ax, ay, az; };
-struct GPSRow   { uint32_t t_ms; uint32_t unix_s; float lat, lon; uint8_t fix, sync; };
-struct BLERow   { uint32_t t_ms; uint32_t unix_s; uint8_t mac[6]; int8_t rssi; };
-
-// Union sized to largest payload
-union EventPayload { AccelRow accel; GPSRow gps; BLERow ble; };
-
-// Renamed from "Event" to avoid any library collisions
-struct LogEvent { EventType type; EventPayload p; };
-
-// Dynamic ring buffer fields
-static LogEvent* g_events      = nullptr;
-static size_t    g_event_cap   = 0;     // max number of events allocated
-static size_t    g_event_count = 0;
-
-static size_t    RING_CAP_BYTES  = 0;   // g_event_cap * sizeof(LogEvent)
-static size_t    NORMAL_THRESH_B = 0;   // 85% of capacity
-static size_t    EMERG_THRESH_B  = 0;   // 87.25%
-
-// Fallback (only used if heap alloc fails)
-#define FALLBACK_EVENT_MAX 512
-static LogEvent g_events_fallback[FALLBACK_EVENT_MAX];
-
-// Max hold guard (forces occasional flush at very low rates)
-#define FLUSH_MAX_HOLD_MS 30000UL  // set to 0 to disable
-
-inline size_t  ring_used_bytes()   { return g_event_count * sizeof(LogEvent); }
-inline uint8_t ring_fullness_pct() { return (RING_CAP_BYTES ? (uint8_t)((ring_used_bytes() * 100U) / RING_CAP_BYTES) : 100); }
-
-// Flush hint (set on each push; serviced in loop())
-volatile uint8_t g_flushHint = 0; // 0 none, 1 normal, 2 emergency
-
-inline void note_flush_thresholds() {
-  size_t usedB = ring_used_bytes();
-  if (usedB >= EMERG_THRESH_B) g_flushHint = 2;
-  else if (usedB >= NORMAL_THRESH_B && g_flushHint < 2) g_flushHint = 1;
+static inline uint8_t rb_read_u8() {
+  uint8_t v = RB.buf[RB.tail];
+  RB.tail = (RB.tail + 1) % RB.cap;
+  RB.used--;
+  return v;
 }
 
-// Probe allocator for largest contiguous block we can get now
-size_t find_max_contiguous_block(size_t max_limit = (1u<<21)) {
-  size_t ok = 0;
-  size_t trySize = 1024; // 1 KB start
-  void* p = nullptr;
-  while (trySize <= max_limit) {
-    p = os_malloc(trySize);
-    if (!p) break;
-    os_free(p);
-    ok = trySize;
-    trySize <<= 1;
-  }
-  size_t lo = ok, hi = trySize;
-  while (hi > lo + 1024) {
-    size_t mid = lo + (hi - lo)/2;
-    p = os_malloc(mid);
-    if (p) { os_free(p); lo = mid; }
-    else   { hi = mid; }
-  }
-  return lo;
-}
-
-bool push_event(const LogEvent& e){
-  if (!g_events || g_event_count >= g_event_cap) return false;
-  g_events[g_event_count++] = e;
+// TLV: [type:1][len:1][payload:len]
+static bool rb_push_event(EvType type, const uint8_t* payload, uint8_t len) {
+  const uint32_t need = 2 + len;
+  if (!RB.buf || RB.cap < need) return false;
+  if (rb_free() < need) { RB.drops++; return false; }
+  rb_write_u8((uint8_t)type);
+  rb_write_u8(len);
+  for (uint8_t i = 0; i < len; i++) rb_write_u8(payload[i]);
   return true;
 }
 
-void alloc_event_ring_from_heap(){
-  size_t maxBlock = find_max_contiguous_block();
-  const size_t reserve = 8 * 1024;                   // ~8 KB safety headroom
-  size_t usable = (maxBlock > reserve) ? (maxBlock - reserve) : (maxBlock / 2);
-
-  size_t cap = usable / sizeof(LogEvent);
-  const size_t min_events = 256;
-  const size_t max_events = 8000;                    // safety upper bound
-  if (cap < min_events) cap = min_events;
-  if (cap > max_events) cap = max_events;
-
-  for (int tries = 0; tries < 6; ++tries) {
-    g_events = (LogEvent*) os_malloc(cap * sizeof(LogEvent));
-    if (g_events) break;
-    cap = (cap * 95) / 100;                          // back off 5%
-    if (cap < min_events) break;
+static bool rb_pop_event(uint8_t& out_type, uint8_t& out_len, uint8_t* out_payload, uint8_t out_payload_max) {
+  if (RB.used < 2) return false;
+  out_type = rb_read_u8();
+  out_len  = rb_read_u8();
+  if (out_len > out_payload_max) {
+    for (uint8_t i = 0; i < out_len && RB.used > 0; i++) (void)rb_read_u8();
+    return false;
   }
-
-  if (!g_events) {
-    g_events     = g_events_fallback;
-    g_event_cap  = FALLBACK_EVENT_MAX;
-  } else {
-    g_event_cap  = cap;
-  }
-
-  RING_CAP_BYTES  = g_event_cap * sizeof(LogEvent);
-  NORMAL_THRESH_B = (RING_CAP_BYTES * 85)   / 100;   // 85.00%
-  EMERG_THRESH_B  = (RING_CAP_BYTES * 8725) / 10000; // 87.25%
-
-  Serial.print("Event size="); Serial.print((int)sizeof(LogEvent));
-  Serial.print(" bytes, ring events="); Serial.print(g_event_cap);
-  Serial.print(" ("); Serial.print((unsigned long)RING_CAP_BYTES); Serial.println(" bytes)");
-  Serial.print("Flush thresholds: normal @ "); Serial.print((unsigned long)NORMAL_THRESH_B);
-  Serial.print(" B (85%), emergency @ "); Serial.print((unsigned long)EMERG_THRESH_B);
-  Serial.println(" B (87.25%)");
-}
-
-// ====================================================================
-// GPS/NMEA globals (declare BEFORE functions that use them)
-// ====================================================================
-static const size_t NMEA_MAX=160;
-char   nmeaLine[NMEA_MAX]; size_t nmeaIdx=0; bool nmeaOverflow=false;
-bool   gpsValid=false; float gpsLat=NAN, gpsLon=NAN;
-uint32_t gpsSessionStart = 0; // used by RMC freshness check
-bool sawRmcThisSession = false;
-
-// ====================================================================
-// GNSS time discipline hook (called from parseRMC)
-// ====================================================================
-void time_on_gps_utc(int yyyy, int mo, int dd, int hh, int mi, int ss){
-  if (!plausibleYear(yyyy)) return;
-  uint64_t gps_utc_ms = unix_ms_from_ymdhms(yyyy, mo, dd, hh, mi, ss);
-  uint64_t now_ms     = uptime_ms64();
-
-  double pred_ms = g_clock.phase_ms + g_clock.scale * (double)(now_ms - g_clock.t0_ms);
-  double err_ms  = (double)gps_utc_ms - pred_ms;
-
-  const double SLEW_CAP_MS = 50.0;
-  if (err_ms < -SLEW_CAP_MS) err_ms = -SLEW_CAP_MS;
-  if (err_ms >  SLEW_CAP_MS) err_ms =  SLEW_CAP_MS;
-  g_clock.phase_ms += err_ms;
-
-  static bool have_ref=false; static uint64_t ref_uptime=0, ref_gps=0;
-  if (!have_ref){ have_ref=true; ref_uptime=now_ms; ref_gps=gps_utc_ms; }
-  uint64_t du = now_ms - ref_uptime, dg = gps_utc_ms - ref_gps;
-  if (du >= 60000ULL){
-    double meas_scale = (double)dg / (double)du;      // ms/ms
-    const double A = 0.02;
-    g_clock.scale = (1.0 - A)*g_clock.scale + A*meas_scale;
-    ref_uptime = now_ms; ref_gps = gps_utc_ms;
-  }
-
-  g_clock.t0_ms  = now_ms;
-  g_clock.synced = true;
-
-  timeSynced    = true;
-  syncEventFlag = true;
-  noFlushUntilMs = millis() + QUIET_AFTER_SYNC_MS;
-}
-
-// ====================================================================
-// ADXL345 (I2C) + FIFO helpers
-// ====================================================================
-static uint8_t ADXL_ADDR=0x1D; // auto-probe to 0x53 if needed
-bool i2cWrite8(uint8_t a,uint8_t r,uint8_t v){ Wire.beginTransmission(a); Wire.write(r); Wire.write(v); return Wire.endTransmission()==0; }
-bool i2cReadBytes(uint8_t a,uint8_t r,uint8_t* b,size_t n){
-  Wire.beginTransmission(a); Wire.write(r);
-  if(Wire.endTransmission(false)!=0) return false;
-  size_t got=Wire.requestFrom((int)a,(int)n);
-  for(size_t i=0;i<got && i<n;i++) b[i]=Wire.read();
-  return got==n;
-}
-uint8_t i2cRead8(uint8_t a,uint8_t r){ uint8_t v=0; i2cReadBytes(a,r,&v,1); return v; }
-
-bool adxl_init(){
-  uint8_t id=i2cRead8(ADXL_ADDR,0x00);
-  if(id!=0xE5){ ADXL_ADDR=(ADXL_ADDR==0x1D)?0x53:0x1D; id=i2cRead8(ADXL_ADDR,0x00); if(id!=0xE5) return false; }
-
-  // 12.5 Hz, LOW_POWER=1
-  i2cWrite8(ADXL_ADDR,0x2C,0x17); // BW_RATE
-  i2cWrite8(ADXL_ADDR,0x31,0x00); // DATA_FORMAT: ±2g, 10-bit
-  i2cWrite8(ADXL_ADDR,0x2D,0x08); // POWER_CTL: MEASURE=1
-
-  // FIFO stream mode + watermark
-  uint8_t wm = (ACCEL_FIFO_WATERMARK < 1) ? 1 : (ACCEL_FIFO_WATERMARK > 32 ? 32 : ACCEL_FIFO_WATERMARK);
-  i2cWrite8(ADXL_ADDR, 0x38, (0b10<<6) | (wm & 0x1F));  // FIFO_CTL: STREAM + watermark
-
-#if ACCEL_USE_FIFO_INT
-  i2cWrite8(ADXL_ADDR, 0x2E, 0x02);   // INT_ENABLE: WATERMARK
-  i2cWrite8(ADXL_ADDR, 0x2F, 0x00);   // INT_MAP: WATERMARK -> INT1
-#else
-  i2cWrite8(ADXL_ADDR, 0x2E, 0x00);   // INT_ENABLE: none   <-- fixed
-#endif
-
-  (void)i2cRead8(ADXL_ADDR, 0x30);    // Clear any latched INT_SOURCE
+  for (uint8_t i = 0; i < out_len; i++) out_payload[i] = rb_read_u8();
   return true;
 }
 
-inline float to_g(int16_t c){ return c*0.0039f; }
+// ===============================
+// Schedulers
+// ===============================
+static bool in_window(uint32_t now_ms, uint32_t period_ms, uint32_t window_ms) {
+  if (period_ms == 0) return false;
+  return ((now_ms % period_ms) < window_ms);
+}
 
-#if ACCEL_USE_FIFO_INT
-volatile bool g_accelIntFlag = false;
-void accel_isr(){ g_accelIntFlag = true; }
-#endif
+// ===============================
+// ADXL345 minimal
+// ===============================
+static bool acc_present = false;
+static uint8_t acc_addr = 0x53;
+static uint32_t acc_ok = 0;
+static uint32_t acc_fail = 0;
 
-// Read up to 32 samples from FIFO in one I2C burst; timestamp evenly at ODR.
-void service_accel_fifo(){
-  (void)i2cRead8(ADXL_ADDR, 0x30); // Ack/clear latched source (harmless in polling)
+static bool i2c_write_reg(uint8_t addr, uint8_t reg, uint8_t val) {
+  Wire.beginTransmission(addr);
+  Wire.write(reg);
+  Wire.write(val);
+  return Wire.endTransmission() == 0;
+}
+static bool i2c_read_regs(uint8_t addr, uint8_t reg, uint8_t* dst, uint8_t n) {
+  Wire.beginTransmission(addr);
+  Wire.write(reg);
+  if (Wire.endTransmission(false) != 0) return false;
+  uint8_t got = Wire.requestFrom(addr, n);
+  if (got != n) return false;
+  for (uint8_t i = 0; i < n; i++) dst[i] = Wire.read();
+  return true;
+}
 
-  uint8_t fifo_status = i2cRead8(ADXL_ADDR, 0x39);
-  uint8_t n = fifo_status & 0x3F;          // 0..32
-  if (n == 0) return;
-  if (n > 32) n = 32;
+static uint8_t adxl_bw_rate_for_odr(float hz) {
+  if (hz <= 12.5f) return 0x0A;
+  if (hz <= 25.0f) return 0x0B;
+  if (hz <= 50.0f) return 0x0C;
+  return 0x0D;
+}
+static uint8_t adxl_dataformat_for_range(uint8_t g) {
+  uint8_t r = (g <= 2) ? 0 : (g <= 4) ? 1 : (g <= 8) ? 2 : 3;
+  return (1 << 3) | (r & 0x03); // FULL_RES + range
+}
 
-  const uint16_t bytes = 6 * n;
-  uint8_t buf[6*32];
-  if (!i2cReadBytes(ADXL_ADDR, 0x32, buf, bytes)) return;
+static bool acc_init() {
+  uint8_t devid = 0;
+  if (i2c_read_regs(0x53, 0x00, &devid, 1) && devid == 0xE5) { acc_addr = 0x53; acc_present = true; }
+  else if (i2c_read_regs(0x1D, 0x00, &devid, 1) && devid == 0xE5) { acc_addr = 0x1D; acc_present = true; }
+  else { acc_present = false; return false; }
 
-  const uint32_t period = ACCEL_PERIOD_MS;
-  const uint32_t now_ms = millis();
-  const uint32_t first_ts = now_ms - (uint32_t)(n-1)*period;
+  i2c_write_reg(acc_addr, 0x2D, 0x00);
+  i2c_write_reg(acc_addr, 0x2C, adxl_bw_rate_for_odr(CFG.acc_odr_hz));
+  i2c_write_reg(acc_addr, 0x31, adxl_dataformat_for_range(CFG.acc_range_g));
+  i2c_write_reg(acc_addr, 0x2D, 0x08);
+  return true;
+}
 
-  for (uint8_t i = 0; i < n; i++){
-    const uint8_t* b = &buf[6*i];
-    int16_t x = (int16_t)(b[1]<<8 | b[0]);
-    int16_t y = (int16_t)(b[3]<<8 | b[2]);
-    int16_t z = (int16_t)(b[5]<<8 | b[4]);
+static bool acc_read_g(float& xg, float& yg, float& zg) {
+  if (!acc_present) return false;
+  uint8_t b[6];
+  if (!i2c_read_regs(acc_addr, 0x32, b, 6)) return false;
+  int16_t x = (int16_t)((b[1] << 8) | b[0]);
+  int16_t y = (int16_t)((b[3] << 8) | b[2]);
+  int16_t z = (int16_t)((b[5] << 8) | b[4]);
+  const float scale = 0.0039f;
+  xg = x * scale; yg = y * scale; zg = z * scale;
+  return true;
+}
 
-    LogEvent e; e.type = EV_ACCEL;
-    e.p.accel.t_ms   = first_ts + (uint32_t)i*period;
-    e.p.accel.unix_s = utc_time_valid() ? utc_now_s() : 0;
-    e.p.accel.ax     = to_g(x);
-    e.p.accel.ay     = to_g(y);
-    e.p.accel.az     = to_g(z);
+// ACC payload: uint32 ms + 3 floats
+static void acc_push_sample(uint32_t ms, float x, float y, float z) {
+  uint8_t p[16];
+  memcpy(p + 0,  &ms, 4);
+  memcpy(p + 4,  &x,  4);
+  memcpy(p + 8,  &y,  4);
+  memcpy(p + 12, &z,  4);
+  rb_push_event(EVT_ACC, p, sizeof(p));
+}
 
-    if (!push_event(e)) { flushBuffers(true, FR_EMERGENCY); (void)push_event(e); }
-    else { note_flush_thresholds(); }
+// ===============================
+// ACC pacing via NRF_TIMER1
+// ===============================
+static volatile uint32_t acc_ticks = 0;
+
+static void acc_timer1_start_12_5hz() {
+  NRF_TIMER1->MODE      = TIMER_MODE_MODE_Timer;
+  NRF_TIMER1->BITMODE   = TIMER_BITMODE_BITMODE_32Bit;
+  NRF_TIMER1->PRESCALER = 4;      // 1 MHz
+  NRF_TIMER1->CC[0]     = 80000;  // 80 ms
+  NRF_TIMER1->SHORTS    = TIMER_SHORTS_COMPARE0_CLEAR_Msk;
+
+  NRF_TIMER1->EVENTS_COMPARE[0] = 0;
+  NRF_TIMER1->INTENSET  = TIMER_INTENSET_COMPARE0_Msk;
+
+  NVIC_SetPriority(TIMER1_IRQn, 7);
+  NVIC_ClearPendingIRQ(TIMER1_IRQn);
+  NVIC_EnableIRQ(TIMER1_IRQn);
+
+  NRF_TIMER1->TASKS_CLEAR = 1;
+  NRF_TIMER1->TASKS_START = 1;
+}
+
+extern "C" void TIMER1_IRQHandler(void) {
+  if (NRF_TIMER1->EVENTS_COMPARE[0]) {
+    NRF_TIMER1->EVENTS_COMPARE[0] = 0;
+    acc_ticks++;
   }
-
-  // Optional: if (n == 32) Serial.println("[ACCEL] FIFO full at read (possible drops)");
 }
 
-// ====================================================================
-// GPS standby/wake (u-blox UBX)
-// ====================================================================
-void sendUBX(uint8_t cls, uint8_t id, const uint8_t* payload, uint16_t len){
-  uint8_t ckA = 0, ckB = 0;
-  auto upd = [&](uint8_t b){ ckA = ckA + b; ckB = ckB + ckA; Serial1.write(b); };
-  Serial1.write(0xB5); Serial1.write(0x62);
-  upd(cls); upd(id);
-  upd(len & 0xFF); upd((len >> 8) & 0xFF);
-  for(uint16_t i=0;i<len;i++) upd(payload[i]);
-  Serial1.write(ckA); Serial1.write(ckB);
-}
-// UBX-RXM-PMREQ (0x02 0x41): version=0, duration=0; flags.force=1; wakeupSources.uartrx=1
-void gpsStandby(){
-  uint8_t p[16]; memset(p, 0, sizeof(p));
-  uint32_t flags = (1u << 2); // force
-  memcpy(&p[8],  &flags, 4);
-  uint32_t wake  = (1u << 3); // uartrx
-  memcpy(&p[12], &wake,  4);
-  sendUBX(0x02, 0x41, p, sizeof(p));
-  Serial1.flush();
-}
-void gpsWake(){ Serial1.write('\r'); Serial1.write('\n'); Serial1.flush(); }
+// ===============================
+// BLE (scan + dedup)
+// ===============================
+static bool ble_scanning = false;
 
-// ====================================================================
-// BLE helpers + callback → EV_BLE
-// ====================================================================
-static inline uint16_t BLE_UNITS(float ms) { return (uint16_t)((ms / 0.625f) + 0.5f); }
-void macToStrMSB(const uint8_t macLE[6], char out[18]) {
-  static const char kHexChars[] = "0123456789ABCDEF";
-  int o=0;
-  for(int i=5;i>=0;--i){
-    uint8_t b = macLE[i];
-    out[o++] = kHexChars[(b>>4)&0x0F];
-    out[o++] = kHexChars[b&0x0F];
-    if(i) out[o++]=':';
+struct Mac6 { uint8_t b[6]; };
+static Mac6* dedup_macs = nullptr;
+static uint16_t dedup_count = 0;
+static uint16_t dedup_cap = 0;
+static uint32_t dedup_window_id = 0;
+
+static bool mac_equal(const uint8_t* a, const uint8_t* b) {
+  for (int i = 0; i < 6; i++) if (a[i] != b[i]) return false;
+  return true;
+}
+static void dedup_reset(uint32_t window_id) {
+  dedup_window_id = window_id;
+  dedup_count = 0;
+}
+static bool dedup_seen_or_add(const uint8_t mac[6]) {
+  if (!CFG.ble_dedup_per_window) return false;
+  for (uint16_t i = 0; i < dedup_count; i++) {
+    if (mac_equal(dedup_macs[i].b, mac)) return true;
   }
-  out[o]='\0';
+  if (dedup_count < dedup_cap) {
+    memcpy(dedup_macs[dedup_count].b, mac, 6);
+    dedup_count++;
+  }
+  return false;
 }
 
-// Scan state
-bool     bleActive = false;
-uint32_t bleStartMs = 0;
-uint32_t lastBleCycleStartMs = 0;
+// BLE payload: uint32 ms + 6 mac + int8 rssi
+static void ble_push(uint32_t ms, const uint8_t mac[6], int8_t rssi) {
+  uint8_t p[11];
+  memcpy(p + 0, &ms, 4);
+  memcpy(p + 4, mac, 6);
+  memcpy(p + 10, &rssi, 1);
+  rb_push_event(EVT_BLE, p, sizeof(p));
+}
 
-// Forward decl for flush used in callback
-void startBleScan();
-void stopBleScan();
+static void scan_callback(ble_gap_evt_adv_report_t* report) {
+  uint8_t mac[6];
+  memcpy(mac, report->peer_addr.addr, 6);
+  int8_t rssi = report->rssi;
 
-// BLE report callback
-void scan_callback(ble_gap_evt_adv_report_t* report)
-{
-  if (mscMode) { Bluefruit.Scanner.resume(); return; }
+  uint32_t now = millis();
+  if (dedup_seen_or_add(mac)) { Bluefruit.Scanner.resume(); return; }
 
-  bool allow_log =
-  #if BLE_DEDUP_PER_WINDOW
-    should_log_and_remember(report->peer_addr.addr);
-  #else
-    true;
-  #endif
-
-  if (allow_log){
-    LogEvent e; e.type = EV_BLE;
-    e.p.ble.t_ms   = (uint32_t)millis();
-    e.p.ble.unix_s = utc_time_valid() ? utc_now_s() : 0;
-    memcpy(e.p.ble.mac, report->peer_addr.addr, 6);
-    e.p.ble.rssi   = report->rssi;
-
-    if (!push_event(e)){ flushBuffers(true, FR_EMERGENCY); (void)push_event(e); }
-    else { note_flush_thresholds(); }
-  }
+  ble_push(now, mac, rssi);
   Bluefruit.Scanner.resume();
 }
 
-void startBleScan() {
-  if (mscMode || bleActive) return;
-  #if BLE_DEDUP_PER_WINDOW
-    bleSeenCount = 0;
-  #endif
-  Bluefruit.Scanner.start(0);       // indefinite; stop after BLE_ACTIVE_MS
-  bleStartMs = millis();
-  bleActive  = true;
+// Convert ms to 0.625 ms units (scanner API units)
+static uint16_t ms_to_scan_units_0p625(uint32_t ms) {
+  uint32_t units = (ms * 1600UL + 999UL) / 1000UL; // ceil
+  if (units < 4) units = 4;
+  if (units > 0xFFFF) units = 0xFFFF;
+  return (uint16_t)units;
 }
-void stopBleScan() {
-  if (!bleActive) return;
+
+static void ble_start_scan() {
+  if (ble_scanning) return;
+  ble_scanning = true;
+
+  Bluefruit.Scanner.setRxCallback(scan_callback);
+  Bluefruit.Scanner.restartOnDisconnect(true);
+  Bluefruit.Scanner.filterRssi(-100);
+
+  float duty = CFG.ble_scan_duty;
+  if (duty < 0.01f) duty = 0.01f;
+  if (duty > 1.00f) duty = 1.00f;
+
+  uint32_t interval_ms = CFG.ble_scan_interval_ms;
+  if (interval_ms < 20) interval_ms = 20;
+
+  uint32_t window_ms = (uint32_t)((float)interval_ms * duty);
+  if (window_ms < 2) window_ms = 2;
+  if (window_ms > interval_ms) window_ms = interval_ms;
+
+  uint16_t interval_units = ms_to_scan_units_0p625(interval_ms);
+  uint16_t window_units   = ms_to_scan_units_0p625(window_ms);
+  if (window_units > interval_units) window_units = interval_units;
+
+  Bluefruit.Scanner.setInterval(interval_units, window_units);
+  Bluefruit.Scanner.useActiveScan(false);
+  Bluefruit.Scanner.start(0);
+}
+
+static void ble_stop_scan() {
+  if (!ble_scanning) return;
+  ble_scanning = false;
   Bluefruit.Scanner.stop();
-  bleActive = false;
-  lastBleCycleStartMs = millis();
 }
 
-// ====================================================================
-// SD bus helpers + session open/close
-// ====================================================================
-static inline void sd_spi_bus_wake(){
-  if (sdBusAwake) return;
-  pinMode(SD_CS_PIN, OUTPUT);
-  digitalWrite(SD_CS_PIN, HIGH);  // de-select card
-  SPI.begin();
-  delayMicroseconds(5);
-  sdBusAwake = true;
-}
+// ===============================
+// GPS non-blocking (bounded) + backup sleep
+// ===============================
+#define GPS_SERIAL Serial1
 
-static inline void sd_spi_bus_sleep(){
-  if (!sdBusAwake) return;
-  digitalWrite(SD_CS_PIN, HIGH);
-  pinMode(SD_CS_PIN, INPUT_PULLUP);   // ensure de-selected
-  SPI.end();
-  pinMode(MOSI, INPUT);
-  pinMode(SCK,  INPUT);
-  pinMode(MISO, INPUT_PULLUP);
-  sdBusAwake = false;
-}
+struct GpsState {
+  bool    rmc_valid = false;
+  bool    have_latlon = false;
+  float   lat = 0.0f;
+  float   lon = 0.0f;
+  bool    have_sats = false;
+  uint8_t sats = 0;
+  bool    have_hdop = false;
+  float   hdop = 99.9f;
 
-static bool sd_session_begin(){
-  if (mscMode) return false;      // logging paused during MSC
-  sd_spi_bus_wake();
-  if (!sd.begin(sdCfg)) {
-    sdOK = false;
-    sd_spi_bus_sleep();
-    return false;
+  void reset() {
+    rmc_valid = false;
+    have_latlon = false;
+    lat = lon = 0.0f;
+    have_sats = false;
+    sats = 0;
+    have_hdop = false;
+    hdop = 99.9f;
   }
-  sdOK = true;
+};
 
-  accelFile = sd.open(ACCEL_FILE, O_RDWR | O_CREAT | O_AT_END);
-  gpsFile   = sd.open(GPS_FILE,   O_RDWR | O_CREAT | O_AT_END);
-  bleFile   = sd.open(BLE_FILE,   O_RDWR | O_CREAT | O_AT_END);
+static bool gps_busy = false;
+static bool gps_sleeping = false;
+static GpsState gps_st;
+static uint32_t gps_attempt_start_ms = 0;
+static uint32_t gps_attempt_deadline_ms = 0;
 
-  if (accelFile && accelFile.fileSize()==0) accelFile.println("t_ms,unix_s,ax,ay,az");
-  if (gpsFile   && gpsFile.fileSize()==0)   gpsFile.println("t_ms,unix_s,lat,lon,fix,sync");
-  if (bleFile   && bleFile.fileSize()==0)   bleFile.println("t_ms,unix_s,mac,rssi");
+static char gps_line[128];
+static uint8_t gps_line_idx = 0;
 
-  return (bool)accelFile || (bool)gpsFile || (bool)bleFile;
-}
+static bool nmea_degmin_to_dec(const char* s, bool is_lon, float& out) {
+  if (!s || !*s) return false;
+  const char* dot = strchr(s, '.');
+  int len = dot ? (int)(dot - s) : (int)strlen(s);
+  int deg_digits = is_lon ? 3 : 2;
+  if (len < deg_digits + 2) return false;
 
-static void sd_session_end(){
-  if (accelFile) { accelFile.flush(); accelFile.close(); }
-  if (gpsFile)   { gpsFile.flush();   gpsFile.close(); }
-  if (bleFile)   { bleFile.flush();   bleFile.close(); }
-
-  // Only sleep the bus if MSC is not active.
-  if (!mscMode) sd_spi_bus_sleep();
-}
-
-// ====================================================================
-// SD flush timing + helpers
-// ====================================================================
-bool     gpsSessionActive = false;
-uint32_t lastGpsSampleMs  = 0;
-uint32_t acqDeadline      = 0;
-bool     retryUsed        = false;
-
-uint32_t lastFlushMs = 0;
-
-bool inQuietMode(){
-  uint32_t now = millis();
-  bool justSynced = (now < noFlushUntilMs);
-  bool acquiring = gpsSessionActive && ((!timeSynced) || (now - lastValidRmcMs > FIX_LOSS_GRACE_MS));
-  return acquiring || justSynced;
-}
-
-void flushBuffers(bool emergency, uint8_t reason_code){
-  // When mscMode is active we don’t log (except the pre-MSC flush call).
-  if (mscMode && reason_code != FR_MSC) return;
-  if (!emergency && inQuietMode()) return;
-
-  if (!sd_session_begin()) return;
-
-  size_t n_acc = 0, n_gps = 0, n_ble = 0;
-  static size_t acc_total = 0, gps_total = 0, ble_total = 0;
-
-  size_t beforeBytes = ring_used_bytes();
-  uint32_t t0 = millis();
-
-  for(size_t i=0;i<g_event_count;i++){
-    const LogEvent& ev = g_events[i];
-    switch(ev.type){
-      case EV_ACCEL: {
-        const auto& r = ev.p.accel;
-        if(accelFile){
-          accelFile.print(r.t_ms); accelFile.print(',');
-          if (r.unix_s) accelFile.print(r.unix_s);
-          accelFile.print(',');
-          accelFile.print(r.ax,4); accelFile.print(',');
-          accelFile.print(r.ay,4); accelFile.print(',');
-          accelFile.println(r.az,4);
-          n_acc++;
-        }
-      } break;
-      case EV_GPS: {
-        const auto& r = ev.p.gps;
-        if(gpsFile){
-          gpsFile.print(r.t_ms); gpsFile.print(',');
-          if (r.unix_s) gpsFile.print(r.unix_s);
-          gpsFile.print(',');
-          if(isnan(r.lat)) gpsFile.print("NaN"); else gpsFile.print(r.lat,6);
-          gpsFile.print(',');
-          if(isnan(r.lon)) gpsFile.print("NaN"); else gpsFile.print(r.lon,6);
-          gpsFile.print(',');
-          gpsFile.print(r.fix); gpsFile.print(',');
-          gpsFile.println(r.sync);
-          n_gps++;
-        }
-      } break;
-      case EV_BLE: {
-        const auto& r = ev.p.ble;
-        if(bleFile){
-          char macStr[18]; macToStrMSB(r.mac, macStr);
-          bleFile.print(r.t_ms); bleFile.print(',');
-          if (r.unix_s) bleFile.print(r.unix_s);
-          bleFile.print(',');
-          bleFile.print(macStr); bleFile.print(',');
-          bleFile.println(r.rssi);
-          n_ble++;
-        }
-      } break;
-    }
-  }
-
-  sd_session_end();
-
-  g_event_count = 0;
-  lastFlushMs   = millis();
-
-  acc_total += n_acc; gps_total += n_gps; ble_total += n_ble;
-
-  uint32_t dt = lastFlushMs - t0;
-  Serial.print("[FLUSH] ");
-  Serial.print(emergency ? "EMERGENCY" : "normal");
-  Serial.print(" reason="); Serial.print(flush_reason_u8(reason_code));
-  Serial.print(" wrote A="); Serial.print(n_acc);
-  Serial.print(" G=");       Serial.print(n_gps);
-  Serial.print(" B=");       Serial.print(n_ble);
-  Serial.print(" total=");   Serial.print(n_acc + n_gps + n_ble);
-  Serial.print(" cum=(");    Serial.print(acc_total); Serial.print(',');
-                           Serial.print(gps_total); Serial.print(',');
-                           Serial.print(ble_total); Serial.print(')');
-  Serial.print(" bytes_before="); Serial.print((unsigned long)beforeBytes);
-  Serial.print(" pct_before=");
-  Serial.print(RING_CAP_BYTES ? (int)((beforeBytes * 100U) / RING_CAP_BYTES) : 0);
-  Serial.print("% dt_ms=");  Serial.println((int)dt);
-}
-
-// ====================================================================
-// Serial command parser + MSC callbacks
-// ====================================================================
-String cmdLine;
-
-static int32_t msc_read_cb (uint32_t lba, void* buffer, uint32_t bufsize) {
-  if (!mscReady || !sdOK) return -1;
-  uint32_t count = bufsize / 512;
-  SdCard* card = sd.card();
-  if (!card) return -1;
-  for (uint32_t i=0; i<count; i++) {
-    if (!card->readSector(lba + i, (uint8_t*)buffer + i*512)) return -1;
-  }
-  return (int32_t)bufsize;
-}
-static int32_t msc_write_cb (uint32_t lba, uint8_t* buffer, uint32_t bufsize) {
-  if (!mscReady || !sdOK) return -1;
-  uint32_t count = bufsize / 512;
-  SdCard* card = sd.card();
-  if (!card) return -1;
-  for (uint32_t i=0; i<count; i++) {
-    if (!card->writeSector(lba + i, (uint8_t*)buffer + i*512)) return -1;
-  }
-  return (int32_t)bufsize;
-}
-static void msc_flush_cb (void) {
-  if (!sdOK) return;
-  SdCard* card = sd.card();
-  if (card) card->syncDevice();
-}
-static bool msc_startstop_cb (uint8_t power_condition, bool start, bool load_eject) {
-  (void)power_condition; (void)load_eject;
-  mscReady = start && sdOK;
+  char deg_buf[4] = {0};
+  for (int i = 0; i < deg_digits; i++) deg_buf[i] = s[i];
+  int deg = atoi(deg_buf);
+  float minutes = atof(s + deg_digits);
+  out = (float)deg + (minutes / 60.0f);
   return true;
 }
 
-void setMSC(bool on){
-  if (on == mscMode) {
-    Serial.print("MSC already "); Serial.println(on ? "ON" : "OFF");
-    return;
+static int split_csv(char* line, char* fields[], int max_fields) {
+  int n = 0;
+  fields[n++] = line;
+  for (char* p = line; *p && n < max_fields; p++) {
+    if (*p == ',') { *p = '\0'; fields[n++] = p + 1; }
   }
-  if (on) {
-    Serial.println("MSC ON: stopping logging, flushing & closing files…");
-    stopBleScan();
-    flushBuffers(true, FR_MSC);      // writes + closes + leaves bus asleep
-
-    // Now bring bus up, mount SD for MSC access and keep it awake
-    sd_spi_bus_wake();
-    sdOK = sd.begin(sdCfg);
-    if (!sdOK || !sd.card()){
-      Serial.println("MSC ON: SD not initialized/absent.");
-      sd_spi_bus_sleep();
-      return;
-    }
-    uint32_t bc = sd.card()->sectorCount();
-    usb_msc.setCapacity(bc ? bc : 8, 512);
-    mscReady = true;
-    usb_msc.setUnitReady(true);
-    mscMode = true;
-
-    Serial.println("MSC ON: re-enumerating USB to prompt host mount…");
-    TinyUSBDevice.detach(); delay(300); TinyUSBDevice.attach();
-    Serial.println("MSC ON: SD should now appear on the PC.");
-  } else {
-    Serial.println("MSC OFF: unmounting from host…");
-    mscReady = false;
-    usb_msc.setUnitReady(false);
-    delay(10);
-    TinyUSBDevice.detach(); delay(300); TinyUSBDevice.attach();
-
-    mscMode = false;
-
-    // After MSC, put the SPI bus back to sleep
-    sd_spi_bus_sleep();
-
-    Serial.println("MSC OFF: resuming logging.");
-    lastBleCycleStartMs = millis() - BLE_CYCLE_PERIOD_MS;
-    lastGpsSampleMs     = millis() - GPS_SAMPLE_PERIOD_MS;
-  }
+  return n;
 }
 
-void handleSerialCommands(){
-  while (Serial.available()){
-    char c = (char)Serial.read();
-    if (c == '\r') continue;
-    if (c == '\n'){
-      cmdLine.trim();
-      if (cmdLine.length()){
-        String up = cmdLine; up.toUpperCase();
-        if (up == "MSC ON" || up == "USBMSC 1" || up == "MSC=1") setMSC(true);
-        else if (up == "MSC OFF" || up == "USBMSC 0" || up == "MSC=0") setMSC(false);
-        else if (up == "STATUS"){
-          Serial.print("MSC="); Serial.print(mscMode?1:0);
-          Serial.print(" SD=");  Serial.print(sdOK?1:0);
-          Serial.print(" files(");
-          Serial.print((bool)accelFile); Serial.print(',');
-          Serial.print((bool)gpsFile);   Serial.print(',');
-          Serial.print((bool)bleFile);   Serial.print(')');
-          Serial.print(" events="); Serial.print(g_event_count);
-          Serial.print('/'); Serial.print(g_event_cap);
-          Serial.print(" %full="); Serial.print((int)ring_fullness_pct());
-          Serial.print(" usedB="); Serial.print((unsigned long)ring_used_bytes());
-          Serial.print('/'); Serial.println((unsigned long)RING_CAP_BYTES);
-        } else {
-          Serial.print("Unknown cmd: "); Serial.println(cmdLine);
-          Serial.println("Use: 'MSC ON' or 'MSC OFF' (or 'USBMSC 1/0')");
-        }
+// GPS payload: uint32 ms + float lat + float lon
+static void gps_push(uint32_t ms, float lat, float lon) {
+  uint8_t p[12];
+  memcpy(p + 0, &ms, 4);
+  memcpy(p + 4, &lat, 4);
+  memcpy(p + 8, &lon, 4);
+  rb_push_event(EVT_GPS, p, sizeof(p));
+}
+
+static void gps_process_sentence(char* line) {
+  if (line[0] == '$') line++;
+  char* star = strchr(line, '*');
+  if (star) *star = '\0';
+  if (strlen(line) < 5) return;
+
+  char* fields[20] = {0};
+  int nf = split_csv(line, fields, 20);
+  if (nf < 1) return;
+
+  const char* msg = fields[0];
+
+  if (strcmp(msg, "GPGGA") == 0 || strcmp(msg, "GNGGA") == 0) {
+    if (nf > 7 && fields[7] && *fields[7]) { gps_st.sats = (uint8_t)atoi(fields[7]); gps_st.have_sats = true; }
+    if (nf > 8 && fields[8] && *fields[8]) { gps_st.hdop = atof(fields[8]); gps_st.have_hdop = true; }
+
+    if (nf > 5 && fields[2] && *fields[2] && fields[4] && *fields[4]) {
+      float lat = 0.0f, lon = 0.0f;
+      if (nmea_degmin_to_dec(fields[2], false, lat) && nmea_degmin_to_dec(fields[4], true, lon)) {
+        if (fields[3] && (*fields[3] == 'S' || *fields[3] == 's')) lat = -lat;
+        if (fields[5] && (*fields[5] == 'W' || *fields[5] == 'w')) lon = -lon;
+        gps_st.lat = lat; gps_st.lon = lon; gps_st.have_latlon = true;
       }
-      cmdLine = "";
-    } else {
-      cmdLine += c;
-      if (cmdLine.length() > 64) cmdLine = "";
     }
-  }
-}
-
-// ====================================================================
-// NMEA parsing + pump (placed AFTER globals so users are declared)
-// ====================================================================
-static inline int hexval(char h){
-  if(h>='0' && h<='9') return h-'0';
-  h = toupper((unsigned char)h);
-  if(h>='A' && h<='F') return h-'A'+10;
-  return -1;
-}
-bool nmeaChecksumOk(const char* s){
-  const char* star = strrchr(s, '*');
-  if(!s || s[0] != '$' || !star || star[1] == 0 || star[2] == 0) return false;
-  uint8_t cs=0;
-  for(const char* p=s+1; p<star; ++p) cs ^= (uint8_t)(*p);
-  int want = (hexval(star[1])<<4) | hexval(star[2]);
-  return want>=0 && cs == (uint8_t)want;
-}
-float nmeaCoord(const char* ddmm){
-  if(!ddmm||!*ddmm) return NAN;
-  const char* dot=strchr(ddmm,'.'); if(!dot) return NAN;
-  int degDigits=((dot-ddmm)>4)?3:2; char db[4]={0}; strncpy(db,ddmm,degDigits);
-  int deg=atoi(db); float mins=atof(ddmm+degDigits);
-  return deg + mins / 60.0f;
-}
-int  fullYearFromYY(int yy); // already defined above
-void parseRMC(char* s){
-  // $--RMC,time,status,lat,NS,lon,EW,speed,cog,date,...
-  char* p=strchr(s,','); if(!p) return; *p++=0; char* timestr=p;
-  p=strchr(p,','); if(!p) return; *p++=0; char* status=p;
-  p=strchr(p,','); if(!p) return; *p++=0; char* latF=p;
-  p=strchr(p,','); if(!p) return; *p++=0; char* ns=p;
-  p=strchr(p,','); if(!p) return; *p++=0; char* lonF=p;
-  p=strchr(p,','); if(!p) return; *p++=0; char* ew=p;
-  p=strchr(p,','); if(!p) return; *p++=0; p=strchr(p,','); if(!p) return; *p++=0; char* datestr=p;
-
-  bool valid = (*status=='A');
-  float lat = nmeaCoord(latF), lon = nmeaCoord(lonF);
-  if(ns&&*ns=='S') lat=-lat; if(ew&&*ew=='W') lon=-lon;
-
-  if(valid && !isnan(lat) && !isnan(lon)){
-    gpsValid = true; gpsLat = lat; gpsLon = lon; lastValidRmcMs = millis();
-    if (lastValidRmcMs >= gpsSessionStart) sawRmcThisSession = true;
-
-    int hh=0,mi=0,ss=0,dd=1,mo=1,yy=0;
-    if(timestr && strlen(timestr)>=6){ hh=(timestr[0]-'0')*10+(timestr[1]-'0'); mi=(timestr[2]-'0')*10+(timestr[3]-'0'); ss=(timestr[4]-'0')*10+(timestr[5]-'0'); }
-    if(datestr && strlen(datestr)>=6){ dd=(datestr[0]-'0')*10+(datestr[1]-'0'); mo=(datestr[2]-'0')*10+(datestr[3]-'0'); yy=(datestr[4]-'0')*10+(datestr[5]-'0'); }
-    int yyyy = fullYearFromYY(yy);
-
-    time_on_gps_utc(yyyy, mo, dd, hh, mi, ss); // discipline clock
-  } else {
-    gpsValid = false;
-  }
-}
-void pumpGPS(){
-  while(Serial1.available()){
-    int c=Serial1.read(); if(c<0) break; if(c=='\r') continue;
-    if(c=='\n'){
-      if(!nmeaOverflow){
-        nmeaLine[min(nmeaIdx,NMEA_MAX-1)] = '\0';
-        if (nmeaLine[0]=='$' && strstr(nmeaLine, "RMC") && nmeaChecksumOk(nmeaLine)){
-          parseRMC(nmeaLine);
-        }
-      }
-      nmeaIdx=0; nmeaOverflow=false;
-    } else {
-      if(nmeaIdx < NMEA_MAX-2) nmeaLine[nmeaIdx++] = (char)c;
-      else nmeaOverflow = true; // discard this sentence until newline
-    }
-  }
-}
-
-// ====================================================================
-//
-// Low-power sleep helper, Setup, Loop
-//
-// ====================================================================
-extern "C" uint32_t sd_app_evt_wait(void);
-static inline void lowPowerIdleUntil(uint32_t deadline_ms){
-  while ((int32_t)(deadline_ms - millis()) > 0){
-    sd_app_evt_wait(); // sleep until any event (BLE, timers, UART, etc.)
-  }
-}
-
-#if !ACCEL_USE_FIFO_INT
-static uint32_t g_accel_poll_period_ms = 750; // computed in setup()
-static uint32_t nextAccelPollDue = 0;
-#endif
-
-void setup(){
-  Serial.begin(USB_BAUD);
-  uint32_t t0=millis(); while(!Serial && millis()-t0<2000){} // brief wait
-  Serial.println("\n=== Logger + MSC + BLE + GPS duty-cycle + low-power (ADXL FIFO polling) ===");
-
-  Wire.begin();
-  Wire.setClock(400000); // faster I2C for burst FIFO reads
-  Serial1.begin(GPS_BAUD);
-
-  // ADXL345
-  if(!adxl_init()) Serial.println("ADXL345 not found");
-  else Serial.println("ADXL345 @ 12.5 Hz (low-power, FIFO STREAM) OK");
-
-#if ACCEL_USE_FIFO_INT
-  pinMode(ACCEL_INT_PIN, INPUT_PULLUP);
-  attachInterrupt(digitalPinToInterrupt(ACCEL_INT_PIN), accel_isr, RISING);
-#endif
-
-  // NOTE: do NOT mount/open SD here. We mount per-flush or when MSC is turned on.
-
-  // --- MSC init (capacity will be updated when MSC is turned ON) ---
-  usb_msc.setID("CQU", "ITSY SD", "1.0");
-  usb_msc.setCapacity(8, 512); // placeholder; updated on MSC ON
-  usb_msc.setReadWriteCallback(msc_read_cb, msc_write_cb, msc_flush_cb);
-  usb_msc.setStartStopCallback(msc_startstop_cb);
-  usb_msc.begin();
-  usb_msc.setUnitReady(false);
-
-  // --- BLE (Central scanner) ---
-  Bluefruit.autoConnLed(false);
-  Bluefruit.begin(0, 1);
-  Bluefruit.setTxPower(-20);
-  Bluefruit.Scanner.setRxCallback(scan_callback);
-  Bluefruit.Scanner.useActiveScan(false);
-  Bluefruit.Scanner.setInterval(
-    BLE_UNITS(BLE_SCAN_INTERVAL_MS),
-    BLE_UNITS(BLE_SCAN_WINDOW_MS)
-  );
-
-  // Start schedulers soon
-  lastBleCycleStartMs = millis() - BLE_CYCLE_PERIOD_MS;
-  lastGpsSampleMs     = millis() - GPS_SAMPLE_PERIOD_MS;
-
-  // Allocate the unified ring from the allocator's current limit after init
-  alloc_event_ring_from_heap();
-
-#if !ACCEL_USE_FIFO_INT
-  // Compute a safe poll period from ODR & watermark:
-  const uint32_t wm_interval = (uint32_t)ACCEL_FIFO_WATERMARK * ACCEL_PERIOD_MS;           // time to reach WM
-  const uint32_t slack       = (uint32_t)(32 - ACCEL_FIFO_WATERMARK) * ACCEL_PERIOD_MS;    // time from WM to overrun
-  g_accel_poll_period_ms = (slack > 0) ? min(wm_interval/2, (slack*8)/10) : wm_interval/2; // conservative
-  if (g_accel_poll_period_ms < 50) g_accel_poll_period_ms = 50;
-  nextAccelPollDue = millis() + g_accel_poll_period_ms;
-  Serial.print("ACCEL poll period = "); Serial.print(g_accel_poll_period_ms); Serial.println(" ms");
-#endif
-
-  // LEDs off
-  pinMode(LED_BUILTIN, OUTPUT);
-  digitalWrite(LED_BUILTIN, LOW);
-
-  // Ensure SPI bus starts asleep
-  sd_spi_bus_sleep();
-
-  Serial.println("Type 'MSC ON' to mount SD over USB; 'MSC OFF' to resume logging.");
-}
-
-static inline uint32_t min3(uint32_t a, uint32_t b, uint32_t c){ return min(a, min(b, c)); }
-
-void startGpsSession(){
-  gpsWake();
-  gpsSessionActive   = true;
-  gpsSessionStart    = millis();
-  gpsValid           = false;         // fresh-only
-  syncEventFlag      = false;
-  sawRmcThisSession  = false;
-  acqDeadline        = gpsSessionStart + GPS_WARMUP_MS + GPS_FIX_TIMEOUT_MS;
-  retryUsed          = false;
-}
-void stopGpsSession(){
-  gpsStandby();
-  gpsSessionActive = false;
-}
-
-void loop(){
-  handleSerialCommands();
-
-  // If MSC mode is ON, pause everything except command handling
-  if (mscMode) {
-    sd_app_evt_wait();
     return;
   }
 
-  // Normal operation
-  pumpGPS();
+  if (strcmp(msg, "GPRMC") == 0 || strcmp(msg, "GNRMC") == 0) {
+    if (nf > 2 && fields[2] && *fields[2]) gps_st.rmc_valid = (fields[2][0] == 'A');
 
-  // --- Service per-push flush hints ASAP (event-driven, low power) ---
-  if (g_flushHint == 2) {                // emergency
-    flushBuffers(true, FR_EMERGENCY);
-    g_flushHint = 0;
-  } else if (g_flushHint == 1) {         // threshold
-    if (!inQuietMode()) flushBuffers(false, FR_THRESHOLD);
-    g_flushHint = 0;
+    if (nf > 6 && fields[3] && *fields[3] && fields[5] && *fields[5]) {
+      float lat = 0.0f, lon = 0.0f;
+      if (nmea_degmin_to_dec(fields[3], false, lat) && nmea_degmin_to_dec(fields[5], true, lon)) {
+        if (fields[4] && (*fields[4] == 'S' || *fields[4] == 's')) lat = -lat;
+        if (fields[6] && (*fields[6] == 'W' || *fields[6] == 'w')) lon = -lon;
+        gps_st.lat = lat; gps_st.lon = lon; gps_st.have_latlon = true;
+      }
+    }
+    return;
   }
+}
+
+// ---- UBX helpers (no Serial/USB printing, best-effort) ----
+static void gps_ubx_send(uint8_t cls, uint8_t id, const uint8_t* payload, uint16_t len) {
+  uint8_t ckA = 0, ckB = 0;
+  auto upd = [&](uint8_t b) {
+    ckA = (uint8_t)(ckA + b);
+    ckB = (uint8_t)(ckB + ckA);
+  };
+
+  GPS_SERIAL.write((uint8_t)0xB5);
+  GPS_SERIAL.write((uint8_t)0x62);
+
+  GPS_SERIAL.write(cls); upd(cls);
+  GPS_SERIAL.write(id);  upd(id);
+
+  uint8_t lsb = (uint8_t)(len & 0xFF);
+  uint8_t msb = (uint8_t)(len >> 8);
+  GPS_SERIAL.write(lsb); upd(lsb);
+  GPS_SERIAL.write(msb); upd(msb);
+
+  for (uint16_t i = 0; i < len; i++) {
+    GPS_SERIAL.write(payload[i]);
+    upd(payload[i]);
+  }
+
+  GPS_SERIAL.write(ckA);
+  GPS_SERIAL.write(ckB);
+}
+
+// UBX-CFG-RXM (0x06 0x11): [reserved][lpMode], lpMode 0=cont, 1=psm
+static void gps_send_cfg_rxm(uint8_t lpMode) {
+  uint8_t p[2] = { 0x00, lpMode };
+  gps_ubx_send(0x06, 0x11, p, sizeof(p));
+}
+
+// UBX-RXM-PMREQ (0x02 0x41), 16 bytes
+// We sweeped this earlier; the “good” one was flags=0x02 (backup)
+static void gps_send_rxm_pmreq(uint32_t durationMs, uint8_t flags) {
+  uint8_t p[16] = {0};
+  p[0] = 0x00; // version
+  p[4] = (uint8_t)(durationMs & 0xFF);
+  p[5] = (uint8_t)((durationMs >> 8) & 0xFF);
+  p[6] = (uint8_t)((durationMs >> 16) & 0xFF);
+  p[7] = (uint8_t)((durationMs >> 24) & 0xFF);
+  p[8] = flags;
+  gps_ubx_send(0x02, 0x41, p, sizeof(p));
+}
+
+static void gps_drain_uart(uint32_t maxBytes) {
+  uint32_t n = 0;
+  while (GPS_SERIAL.available() > 0 && n < maxBytes) { (void)GPS_SERIAL.read(); n++; }
+}
+
+static void gps_enter_backup_sleep() {
+  if (!CFG.gps_enabled) return;
+  if (!CFG.gps_backup_sleep_enabled) return;
+  if (gps_busy) return;
+  if (gps_sleeping) return;
+
+  gps_drain_uart(512);
+  // Put receiver into backup mode (your “4th mode”).
+  gps_send_rxm_pmreq(0, 0x02);
+  gps_sleeping = true;
+}
+
+static void gps_wake_for_attempt() {
+  if (!CFG.gps_enabled) return;
+
+  // Keep UART up; nudge + set continuous mode.
+  GPS_SERIAL.begin(CFG.gps_baud);
+  GPS_SERIAL.write('\r');
+  GPS_SERIAL.write('\n');
+
+  gps_send_cfg_rxm(0); // continuous
+  gps_sleeping = false;
+}
+
+static void gps_start_attempt() {
+  if (!CFG.gps_enabled) return;
+  if (gps_busy) return;
+
+  gps_wake_for_attempt();
+
+  gps_busy = true;
+  gps_attempt_start_ms = millis();
+  gps_attempt_deadline_ms = gps_attempt_start_ms + CFG.gps_timeout_ms;
+
+  gps_st.reset();
+  gps_line_idx = 0;
+}
+
+// This function is the key: it is time-bounded so BLE is not starved.
+static void gps_poll_bounded() {
+  if (!gps_busy) return;
 
   uint32_t now = millis();
-
-  // ----- BLE scan scheduler -----
-  if (!bleActive) {
-    if (now - lastBleCycleStartMs >= BLE_CYCLE_PERIOD_MS) startBleScan();
-  } else {
-    if (now - bleStartMs >= BLE_ACTIVE_MS) stopBleScan();
+  if ((int32_t)(now - gps_attempt_deadline_ms) >= 0) {
+    gps_busy = false;
+    gps_line_idx = 0;
+    // Immediately go back to lowest GPS power once attempt ends
+    gps_enter_backup_sleep();
+    return;
   }
 
-  // ----- GPS 3-minute scheduler with one-shot retry -----
-  if (!gpsSessionActive) {
-    if (now - lastGpsSampleMs >= GPS_SAMPLE_PERIOD_MS) {
-      startGpsSession();
+  uint32_t start_us = micros();
+  uint32_t bytes = 0;
+
+  while (GPS_SERIAL.available() > 0) {
+    if ((uint32_t)(micros() - start_us) >= CFG.gps_poll_time_budget_us) break;
+    if (bytes >= CFG.gps_poll_byte_budget) break;
+
+    char c = (char)GPS_SERIAL.read();
+    bytes++;
+
+    if (c == '\r') continue;
+
+    if (c == '\n') {
+      if (gps_line_idx > 0) {
+        gps_line[gps_line_idx] = '\0';
+
+        char tmp[128];
+        strncpy(tmp, gps_line, sizeof(tmp));
+        tmp[sizeof(tmp) - 1] = '\0';
+
+        gps_process_sentence(tmp);
+
+        bool sats_ok = gps_st.have_sats && (gps_st.sats >= CFG.gps_min_sats);
+        bool hdop_ok = gps_st.have_hdop && (gps_st.hdop <= CFG.gps_min_hdop);
+
+        if (gps_st.rmc_valid && gps_st.have_latlon && sats_ok && hdop_ok) {
+          gps_push(now, gps_st.lat, gps_st.lon);
+
+          if (CFG.debug_enable && CFG.debug_print_gps_fix) {
+            Serial.print("GPS: lat=");
+            Serial.print(gps_st.lat, 6);
+            Serial.print(" lon=");
+            Serial.println(gps_st.lon, 6);
+          }
+
+          gps_busy = false;
+          gps_line_idx = 0;
+
+          // Drop straight back into backup sleep after a fix
+          gps_enter_backup_sleep();
+          return;
+        }
+      }
+      gps_line_idx = 0;
+    } else {
+      if (gps_line_idx < sizeof(gps_line) - 1) gps_line[gps_line_idx++] = c;
+      else gps_line_idx = 0;
     }
+  }
+}
+
+// ===============================
+// Flush control (BURSTED)
+// ===============================
+static bool flush_requested = false;
+static FlushWhy flush_reason = FLUSH_NORMAL;
+static uint32_t t_last_flush_done = 0;
+
+static const char* flushWhyStr(FlushWhy w) {
+  switch (w) {
+    case FLUSH_NORMAL:   return "NORMAL";
+    case FLUSH_EMERG:    return "EMERG";
+    case FLUSH_FAILSAFE: return "FAILSAFE";
+    default:             return "?";
+  }
+}
+
+static void request_flush(FlushWhy why) {
+  if (why == FLUSH_EMERG) { flush_requested = true; flush_reason = FLUSH_EMERG; return; }
+  if (flush_requested && flush_reason == FLUSH_EMERG) return;
+  flush_requested = true;
+  flush_reason = why;
+}
+
+static void ensure_headers() {
+  if (fAcc.fileSize() == 0) fAcc.println("ms,x_g,y_g,z_g");
+  if (fGps.fileSize() == 0) fGps.println("ms,lat,lon");
+  if (fBle.fileSize() == 0) fBle.println("ms,mac,rssi");
+}
+
+// Returns: (done, wrote_events_this_burst)
+static bool flush_ring_burst(uint32_t& wrote_events_out) {
+  wrote_events_out = 0;
+  if (!sd_ok) return true;
+  if (RB.used == 0) return true;
+
+  ensure_headers();
+
+  uint8_t type = 0, len = 0;
+  uint8_t payload[32];
+
+  for (uint32_t i = 0; i < CFG.sd_flush_max_events_burst; i++) {
+    if (!rb_pop_event(type, len, payload, sizeof(payload))) break;
+
+    wrote_events_out++;
+
+    if (type == EVT_ACC && len == 16) {
+      uint32_t ms; float x, y, z;
+      memcpy(&ms, payload + 0, 4);
+      memcpy(&x,  payload + 4, 4);
+      memcpy(&y,  payload + 8, 4);
+      memcpy(&z,  payload + 12,4);
+
+      fAcc.print(ms); fAcc.print(",");
+      fAcc.print(x, 6); fAcc.print(",");
+      fAcc.print(y, 6); fAcc.print(",");
+      fAcc.println(z, 6);
+
+    } else if (type == EVT_GPS && len == 12) {
+      uint32_t ms; float lat, lon;
+      memcpy(&ms,  payload + 0, 4);
+      memcpy(&lat, payload + 4, 4);
+      memcpy(&lon, payload + 8, 4);
+
+      fGps.print(ms); fGps.print(",");
+      fGps.print(lat, 6); fGps.print(",");
+      fGps.println(lon, 6);
+
+    } else if (type == EVT_BLE && len == 11) {
+      uint32_t ms; int8_t rssi;
+      uint8_t mac[6];
+      memcpy(&ms, payload + 0, 4);
+      memcpy(mac, payload + 4, 6);
+      memcpy(&rssi, payload + 10, 1);
+
+      char s[18];
+      snprintf(s, sizeof(s), "%02X:%02X:%02X:%02X:%02X:%02X",
+               mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+
+      fBle.print(ms); fBle.print(",");
+      fBle.print(s);  fBle.print(",");
+      fBle.println((int)rssi);
+    }
+  }
+
+  if (RB.used == 0 || !ble_scanning) {
+    fAcc.sync(); fGps.sync(); fBle.sync();
+  }
+
+  return (RB.used == 0);
+}
+
+// ===============================
+// Setup helpers
+// ===============================
+static bool sd_init_open_files() {
+  SdSpiConfig cfg(CFG.sd_cs_pin, DEDICATED_SPI, CFG.sd_spi_hz);
+  if (!sd.begin(cfg)) return false;
+
+  if (!fAcc.open("ACC.CSV", O_RDWR | O_CREAT | O_AT_END)) return false;
+  if (!fGps.open("GPS.CSV", O_RDWR | O_CREAT | O_AT_END)) return false;
+  if (!fBle.open("BLE.CSV", O_RDWR | O_CREAT | O_AT_END)) return false;
+  return true;
+}
+
+static void ring_init_dynamic() {
+  uint32_t free_heap = approx_free_heap_bytes();
+  uint32_t target = (uint32_t)(free_heap * CFG.ring_alloc_fraction_of_free_heap);
+
+  const uint32_t MIN_RING = 8UL * 1024UL;
+  const uint32_t MAX_RING = 120UL * 1024UL;
+  if (target < MIN_RING) target = MIN_RING;
+  if (target > MAX_RING) target = MAX_RING;
+
+  RB.buf = (uint8_t*)malloc(target);
+  if (!RB.buf) { RB.cap = 0; return; }
+
+  RB.cap = target;
+  RB.head = RB.tail = RB.used = 0;
+  RB.normal_th = (uint32_t)(RB.cap * CFG.ring_normal_threshold_fraction);
+  RB.emerg_th  = (uint32_t)(RB.cap * CFG.ring_emerg_threshold_fraction);
+}
+
+static void dedup_init() {
+  if (!CFG.ble_dedup_per_window || CFG.ble_dedup_max_macs == 0) return;
+  dedup_cap = CFG.ble_dedup_max_macs;
+  dedup_macs = (Mac6*)malloc(sizeof(Mac6) * dedup_cap);
+  if (!dedup_macs) dedup_cap = 0;
+}
+
+// ===============================
+// Runtime
+// ===============================
+static uint32_t t_last_status = 0;
+static uint32_t t_last_gps_trigger = 0;
+
+static uint32_t acc_ticks_pending_shadow = 0;
+
+static void print_status() {
+  if (!CFG.debug_enable) return;
+
+  Serial.print("[STATUS] ms=");
+  Serial.print(millis());
+  Serial.print(" sd=");
+  Serial.print(sd_ok ? "OK" : "NO");
+  Serial.print(" scan=");
+  Serial.print(ble_scanning ? "ON" : "OFF");
+  Serial.print(" gps_busy=");
+  Serial.print(gps_busy ? 1 : 0);
+  Serial.print(" gps_sleep=");
+  Serial.print(gps_sleeping ? 1 : 0);
+  Serial.print(" acc=ON acc_present=");
+  Serial.print(acc_present ? 1 : 0);
+  if (acc_present) {
+    Serial.print(" acc_addr=0x");
+    Serial.print(acc_addr, HEX);
+  }
+  Serial.print(" acc_ok=");
+  Serial.print(acc_ok);
+  Serial.print(" acc_fail=");
+  Serial.print(acc_fail);
+  Serial.print(" acc_ticks_pending=");
+  Serial.print(acc_ticks_pending_shadow);
+  Serial.print(" ring=");
+  Serial.print(RB.used);
+  Serial.print("/");
+  Serial.print(RB.cap);
+  Serial.print(" used%=");
+  if (RB.cap) Serial.print((100.0f * (float)RB.used / (float)RB.cap), 2);
+  else Serial.print("0.00");
+  Serial.print(" normal@");
+  Serial.print(RB.normal_th);
+  Serial.print(" emerg@");
+  Serial.print(RB.emerg_th);
+  Serial.print(" drops=");
+  Serial.println(RB.drops);
+}
+
+// CPU sleep primitive
+static void sleep_when_idle() {
+#if defined(SOFTDEVICE_PRESENT)
+  // SoftDevice-aware sleep. Any IRQ (TIMER1, BLE, UART, etc.) will wake it.
+  (void)sd_app_evt_wait();
+#else
+  // Best-effort fallback if SoftDevice not present.
+  __WFE();
+#endif
+}
+
+void setup() {
+  if (CFG.debug_enable) {
+    Serial.begin(115200);
+    delay(100);
+  }
+
+  Wire.begin();
+
+  ring_init_dynamic();
+  dedup_init();
+
+  sd_ok = sd_init_open_files();
+  if (CFG.debug_enable && !sd_ok) Serial.println("SD init failed");
+
+  if (CFG.acc_enabled) acc_init();
+
+  Bluefruit.begin();
+  Bluefruit.setTxPower(CFG.ble_tx_power_dbm);
+  Bluefruit.setName("Logger");
+
+  if (CFG.gps_enabled) {
+    GPS_SERIAL.begin(CFG.gps_baud);
+    // Immediately push GPS into lowest power state if we are not in an attempt.
+    gps_enter_backup_sleep();
+  }
+
+  if (CFG.acc_enabled && acc_present) acc_timer1_start_12_5hz();
+
+  uint32_t now = millis();
+  t_last_status = now;
+  t_last_gps_trigger = now;
+  t_last_flush_done = now;
+
+  if (CFG.debug_enable) {
+    Serial.print("Ring cap=");
+    Serial.print(RB.cap);
+    Serial.print(" normal_th=");
+    Serial.print(RB.normal_th);
+    Serial.print(" emerg_th=");
+    Serial.println(RB.emerg_th);
+
+    Serial.print("BLE scan interval_ms=");
+    Serial.print(CFG.ble_scan_interval_ms);
+    Serial.print(" duty=");
+    Serial.println(CFG.ble_scan_duty, 3);
+  }
+}
+
+void loop() {
+  uint32_t now = millis();
+
+  // 1) BLE scheduling FIRST (so scan window is honoured regardless of GPS)
+  bool ble_window = (CFG.ble_log_enabled && in_window(now, CFG.ble_period_ms, CFG.ble_window_ms));
+  if (ble_window) {
+    uint32_t window_id = (CFG.ble_period_ms > 0) ? (now / CFG.ble_period_ms) : 0;
+    if (window_id != dedup_window_id) dedup_reset(window_id);
+    if (!ble_scanning) ble_start_scan();
   } else {
-    bool warmed = (now - gpsSessionStart >= GPS_WARMUP_MS);
-    bool timed  = (now >= acqDeadline);
-    bool fresh  = (lastValidRmcMs >= gpsSessionStart);
+    if (ble_scanning) ble_stop_scan();
+  }
 
-    if (warmed && fresh && gpsValid) {
-      // EV_GPS fix row
-      LogEvent e; e.type = EV_GPS;
-      e.p.gps.t_ms   = (uint32_t)millis();
-      e.p.gps.unix_s = utc_time_valid() ? utc_now_s() : 0;
-      e.p.gps.lat    = gpsLat;
-      e.p.gps.lon    = gpsLon;
-      e.p.gps.fix    = 1;
-      e.p.gps.sync   = (syncEventFlag ? 1 : 0);
-
-      if (!push_event(e)){ flushBuffers(true, FR_EMERGENCY); (void)push_event(e); }
-      else { note_flush_thresholds(); }
-
-      syncEventFlag   = false;
-      stopGpsSession();
-      lastGpsSampleMs = now;
-
-    } else if (timed) {
-      if (!retryUsed && sawRmcThisSession) {
-        acqDeadline += GPS_RETRY_MS;   // one extra bite
-        retryUsed = true;
+  // 2) GPS schedule + bounded poll (cannot starve BLE)
+  if (CFG.gps_enabled) {
+    if (!gps_busy) {
+      if ((uint32_t)(now - t_last_gps_trigger) >= CFG.gps_interval_ms) {
+        t_last_gps_trigger = now;
+        gps_start_attempt();
       } else {
-        // EV_GPS NaN row
-        LogEvent e; e.type = EV_GPS;
-        e.p.gps.t_ms   = (uint32_t)millis();
-        e.p.gps.unix_s = utc_time_valid() ? utc_now_s() : 0;
-        e.p.gps.lat    = NAN;
-        e.p.gps.lon    = NAN;
-        e.p.gps.fix    = 0;
-        e.p.gps.sync   = 0;
-
-        if (!push_event(e)){ flushBuffers(true, FR_EMERGENCY); (void)push_event(e); }
-        else { note_flush_thresholds(); }
-
-        stopGpsSession();
-        lastGpsSampleMs = now;
+        // If we're not due for an attempt, keep GPS in backup sleep
+        gps_enter_backup_sleep();
       }
     }
+    gps_poll_bounded();
   }
 
-  // ----- ADXL345 FIFO polling (no INT pin) -----
-#if !ACCEL_USE_FIFO_INT
-  if ((int32_t)(now - nextAccelPollDue) >= 0){
-    nextAccelPollDue = now + g_accel_poll_period_ms;
-    service_accel_fifo();  // drain all queued samples in one burst
-  }
-#else
-  // If/when you wire the INT pin:
-  if (g_accelIntFlag){
-    g_accelIntFlag = false;
-    service_accel_fifo();
-  }
-#endif
+  // 3) ACC sampling from ticks (stable), but cap catch-up to keep loop responsive
+  if (CFG.acc_enabled && acc_present) {
+    static uint32_t acc_ticks_serviced = 0;
+    uint32_t ticks_now = acc_ticks;
+    uint32_t pending = ticks_now - acc_ticks_serviced;
+    acc_ticks_pending_shadow = pending;
 
-  // ----- Time-based guard (keeps data moving at very low rates) -----
-  if (RING_CAP_BYTES){
-    bool needTime = (FLUSH_MAX_HOLD_MS>0) && (now - lastFlushMs >= FLUSH_MAX_HOLD_MS) && (!inQuietMode());
-    if (needTime) flushBuffers(false, FR_MAXHOLD);
+    uint32_t n = pending;
+    if (n > CFG.acc_max_catchup_per_loop) n = CFG.acc_max_catchup_per_loop;
+
+    for (uint32_t i = 0; i < n; i++) {
+      float x, y, z;
+      if (acc_read_g(x, y, z)) { acc_ok++; acc_push_sample(now, x, y, z); }
+      else { acc_fail++; }
+      acc_ticks_serviced++;
+    }
+  } else {
+    acc_ticks_pending_shadow = 0;
   }
 
-  // ----- Low-power sleep until the next interesting moment -----
-  uint32_t nextBle = bleActive ? (bleStartMs + BLE_ACTIVE_MS) : (lastBleCycleStartMs + BLE_CYCLE_PERIOD_MS);
-  uint32_t nextGps = gpsSessionActive
-                     ? min(gpsSessionStart + GPS_WARMUP_MS, acqDeadline)
-                     : (lastGpsSampleMs + GPS_SAMPLE_PERIOD_MS);
-  uint32_t deadline = min(nextBle, nextGps);
-#if !ACCEL_USE_FIFO_INT
-  deadline = min(deadline, nextAccelPollDue);
-#endif
+  // 4) Flush requests
+  if (RB.used >= RB.emerg_th && RB.emerg_th > 0) request_flush(FLUSH_EMERG);
+  else if (RB.used >= RB.normal_th && RB.normal_th > 0) request_flush(FLUSH_NORMAL);
 
-  if ((int32_t)(deadline - now) > 0) lowPowerIdleUntil(deadline);
-  else sd_app_evt_wait();
+  // FAILSAFE since last successful flush done
+  if (CFG.flush_failsafe_ms > 0) {
+    if ((uint32_t)(now - t_last_flush_done) >= CFG.flush_failsafe_ms) {
+      if (RB.used > 0) request_flush(FLUSH_FAILSAFE);
+    }
+  }
+
+  // 5) Flush servicing with policy + bursting
+  if (flush_requested) {
+    bool allow = true;
+    if (gps_busy && flush_reason != FLUSH_EMERG) allow = false;
+
+    if (allow) {
+      uint32_t wrote = 0;
+      bool done = flush_ring_burst(wrote);
+
+      if (done || (wrote > 0 && RB.used < RB.normal_th)) {
+        t_last_flush_done = millis();
+      }
+
+      if (CFG.debug_enable && wrote > 0 && (done || flush_reason == FLUSH_EMERG)) {
+        Serial.print("[FLUSH] why=");
+        Serial.print(flushWhyStr(flush_reason));
+        Serial.print(" wrote=");
+        Serial.print(wrote);
+        Serial.print(" ring=");
+        Serial.print(RB.used);
+        Serial.print("/");
+        Serial.print(RB.cap);
+        Serial.print(" drops=");
+        Serial.println(RB.drops);
+      }
+
+      if (done) flush_requested = false;
+    }
+  }
+
+  // 6) Status (debug only)
+  if (CFG.debug_enable && CFG.status_print_ms > 0) {
+    if ((uint32_t)(now - t_last_status) >= CFG.status_print_ms) {
+      t_last_status = now;
+      print_status();
+    }
+  }
+
+  // 7) Sleep when idle
+  sleep_when_idle();
 }
