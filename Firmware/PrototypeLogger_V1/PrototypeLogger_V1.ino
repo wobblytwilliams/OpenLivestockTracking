@@ -13,9 +13,9 @@
     If debug_enable=false, USB Serial is NOT started and status printing is effectively off.
 
   NOTE:
-  - This sketch assumes ADXL345 INT1 is wired to PIN_ADXL_INT1 (default GPIO 12 here).
+  - This sketch assumes ADXL345 INT1 is wired to PIN_ADXL_INT1 (default GPIO 13 here).
   - Uses ADXL345 FIFO stream mode + watermark interrupt.
-  - Uses conservative fifo_watermark=10.
+  - Uses AX3-style fifo_watermark=25 for lower MCU wake duty at 12.5 Hz.
 */
 
 #include <Arduino.h>
@@ -24,9 +24,11 @@
 #include <SPI.h>
 #include <SdFat.h>
 #include <bluefruit.h>
+#include "nrf_gpio.h"
 
 #if defined(SOFTDEVICE_PRESENT)
   #include <nrf_soc.h>   // sd_app_evt_wait()
+  #include <nrf_sdm.h>   // sd_softdevice_disable()
 #endif
 
 #define POWER_TEST_NORMAL            0
@@ -38,9 +40,15 @@
 #define POWER_TEST_GPS_ASLEEP_NO_BLE 6
 #define POWER_TEST_GPS_ASLEEP_NO_ACC 7
 #define POWER_TEST_GPS_CYCLE_NO_SD_NO_ACC 8
+#define POWER_TEST_GPS_STANDBY_RELEASE_UART 9
+#define POWER_TEST_GPS_GATE_ACC_BLE_SD_3MIN 10
 
 #ifndef POWER_TEST_MODE
   #define POWER_TEST_MODE POWER_TEST_NORMAL
+#endif
+
+#ifndef BLE_DISABLE_STACK_BETWEEN_WINDOWS
+  #define BLE_DISABLE_STACK_BETWEEN_WINDOWS 0
 #endif
 
 // ===============================
@@ -57,6 +65,10 @@ struct Config {
   uint32_t flush_first_ms    = 0;       // disabled for normal low-power logging
   uint32_t flush_failsafe_ms = 900000;  // 15 min since last SUCCESSFUL flush
 
+  // Board power housekeeping
+  bool     board_power_cleanup = true;
+  bool     usb_disable_when_not_debug = true;
+
   // SD
   bool     sd_enabled = true;
   bool     sd_close_between_flushes = true;
@@ -66,6 +78,7 @@ struct Config {
   bool     sd_power_en_active_high = true;
   uint8_t  sd_cs_pin = 10;
   uint32_t sd_spi_hz = 12000000;
+  uint32_t sd_retry_backoff_ms = 300000;  // avoid tight retry loops after SD failures
 
   // GPS
   bool     gps_enabled      = true;
@@ -79,6 +92,7 @@ struct Config {
   bool     gps_backup_sleep_enabled = true;
   uint32_t gps_wake_settle_ms       = 250;
   uint32_t gps_sleep_refresh_ms     = 30000;
+  bool     gps_release_uart_pins_after_sleep = false;
 
   // BLE
   bool     ble_enabled          = true;
@@ -88,6 +102,9 @@ struct Config {
   bool     ble_dedup_per_window = true;
   uint16_t ble_dedup_max_macs   = 128;
   int8_t   ble_tx_power_dbm     = 0;
+  bool     ble_central_only     = true;  // scanner-only; no advertising/peripheral role
+  bool     ble_conn_led_enabled = false; // LED blink costs power during scan windows
+  bool     ble_disable_stack_between_windows = BLE_DISABLE_STACK_BETWEEN_WINDOWS;
 
   // BLE scan duty within the scan window
   float    ble_scan_duty        = 0.10f;  // 0.05 to 1.0 is a sensible test range
@@ -97,9 +114,11 @@ struct Config {
   bool     acc_enabled   = true;
   float    acc_odr_hz    = 12.5f;
   uint8_t  acc_range_g   = 16;
+  bool     acc_low_power = true;
+  uint32_t i2c_hz        = 400000;
 
   // ADXL345 FIFO / INT
-  uint8_t  fifo_watermark = 10;   // conservative
+  uint8_t  fifo_watermark = 25;   // 25 samples at 12.5 Hz = wake roughly every 2 seconds
   bool     fifo_int_active_high = true;  // ADXL345 INT is active high by default
 
   // Loop budgets (keep BLE stable)
@@ -117,7 +136,7 @@ static Config CFG;
 // ===============================
 // PINS
 // ===============================
-static const uint8_t PIN_ADXL_INT1 = 12;   // per your wiring plan (GPIO 12)
+static const uint8_t PIN_ADXL_INT1 = 13;   // ADXL345 INT1 wired to GPIO13
 
 // ===============================
 // SD
@@ -128,6 +147,7 @@ static bool sd_ok = false;
 static bool sd_files_open = false;
 static bool sd_startup_failed = false;
 static uint32_t sd_write_fail = 0;
+static uint32_t sd_next_retry_ms = 0;
 static uint32_t ring_bad_events = 0;
 
 // ===============================
@@ -236,10 +256,22 @@ static bool i2c_read_regs(uint8_t addr, uint8_t reg, uint8_t* dst, uint8_t n) {
 }
 
 static uint8_t adxl_bw_rate_for_odr(float hz) {
-  if (hz <= 12.5f) return 0x0A;
-  if (hz <= 25.0f) return 0x0B;
-  if (hz <= 50.0f) return 0x0C;
-  return 0x0D;
+  if (hz <= 0.10f) return 0x00;
+  if (hz <= 0.20f) return 0x01;
+  if (hz <= 0.39f) return 0x02;
+  if (hz <= 0.78f) return 0x03;
+  if (hz <= 1.56f) return 0x04;
+  if (hz <= 3.13f) return 0x05;
+  if (hz <= 6.25f) return 0x06;
+  if (hz <= 12.5f) return 0x07;
+  if (hz <= 25.0f) return 0x08;
+  if (hz <= 50.0f) return 0x09;
+  if (hz <= 100.0f) return 0x0A;
+  if (hz <= 200.0f) return 0x0B;
+  if (hz <= 400.0f) return 0x0C;
+  if (hz <= 800.0f) return 0x0D;
+  if (hz <= 1600.0f) return 0x0E;
+  return 0x0F;
 }
 static uint8_t adxl_dataformat_for_range(uint8_t g) {
   uint8_t r = (g <= 2) ? 0 : (g <= 4) ? 1 : (g <= 8) ? 2 : 3;
@@ -277,14 +309,16 @@ static bool acc_init_fifo_int() {
   i2c_write_reg(acc_addr, REG_POWER_CTL, 0x00);
 
   // ODR + range
-  i2c_write_reg(acc_addr, REG_BW_RATE, adxl_bw_rate_for_odr(CFG.acc_odr_hz));
+  uint8_t bw_rate = adxl_bw_rate_for_odr(CFG.acc_odr_hz);
+  if (CFG.acc_low_power && bw_rate >= 0x07 && bw_rate <= 0x0C) bw_rate |= 0x10;
+  i2c_write_reg(acc_addr, REG_BW_RATE, bw_rate);
   i2c_write_reg(acc_addr, REG_DATA_FORMAT, adxl_dataformat_for_range(CFG.acc_range_g));
 
-  // FIFO stream mode + watermark (lower 5 bits are samples-1 for watermark)
+  // FIFO stream mode + watermark. ADXL345 uses the lower 5 bits as the sample count.
   uint8_t wm = CFG.fifo_watermark;
   if (wm < 1) wm = 1;
-  if (wm > 30) wm = 30; // keep safe margin
-  uint8_t fifo_ctl = (0x02 << 6) | ((wm - 1) & 0x1F); // stream mode=2
+  if (wm > 31) wm = 31; // keep safe margin below full FIFO
+  uint8_t fifo_ctl = (0x02 << 6) | (wm & 0x1F); // stream mode=2
   i2c_write_reg(acc_addr, REG_FIFO_CTL, fifo_ctl);
 
   // Route watermark interrupt to INT1 (INT_MAP bit=0 -> INT1)
@@ -325,13 +359,14 @@ static bool acc_read_raw(int16_t& x, int16_t& y, int16_t& z) {
   return true;
 }
 
-// ACC payload: uint32 ms + 3 floats
-static void acc_push_sample(uint32_t ms, float x, float y, float z) {
-  uint8_t p[16];
+// ACC payload: uint32 ms + raw int16 x/y/z.
+// Convert to g only when writing CSV so the wake path stays short.
+static void acc_push_sample(uint32_t ms, int16_t x, int16_t y, int16_t z) {
+  uint8_t p[10];
   memcpy(p + 0,  &ms, 4);
-  memcpy(p + 4,  &x,  4);
-  memcpy(p + 8,  &y,  4);
-  memcpy(p + 12, &z,  4);
+  memcpy(p + 4,  &x,  2);
+  memcpy(p + 6,  &y,  2);
+  memcpy(p + 8,  &z,  2);
   rb_push_event(EVT_ACC, p, sizeof(p));
 }
 
@@ -344,25 +379,19 @@ static void acc_drain_fifo_to_ring(uint32_t ms_now) {
   uint8_t n = acc_fifo_entries();
   uint32_t drained = 0;
 
-  // Convert scale (FULL_RES: 3.9 mg/LSB approx)
-  const float scale_g = 0.0039f;
-  const float sample_period_ms = (CFG.acc_odr_hz > 0.0f) ? (1000.0f / CFG.acc_odr_hz) : 0.0f;
+  const uint32_t sample_period_ms = (CFG.acc_odr_hz > 0.0f) ? (uint32_t)((1000.0f / CFG.acc_odr_hz) + 0.5f) : 0;
 
   for (uint8_t i = 0; i < n; i++) {
     int16_t rx, ry, rz;
     if (!acc_read_raw(rx, ry, rz)) { acc_fail++; break; }
 
-    float x = rx * scale_g;
-    float y = ry * scale_g;
-    float z = rz * scale_g;
-
     acc_ok++;
     uint32_t sample_ms = ms_now;
-    if (sample_period_ms > 0.0f) {
-      uint32_t sample_age_ms = (uint32_t)(((float)(n - 1 - i) * sample_period_ms) + 0.5f);
+    if (sample_period_ms > 0) {
+      uint32_t sample_age_ms = (uint32_t)(n - 1 - i) * sample_period_ms;
       sample_ms = (ms_now >= sample_age_ms) ? (ms_now - sample_age_ms) : 0;
     }
-    acc_push_sample(sample_ms, x, y, z);
+    acc_push_sample(sample_ms, rx, ry, rz);
     drained++;
   }
 
@@ -392,6 +421,105 @@ static void status_led_set(bool on) {
 #endif
 }
 
+// ===============================
+// Board power housekeeping
+// ===============================
+static void dotstar_write_byte(uint8_t value) {
+#if defined(PIN_DOTSTAR_DATA) && defined(PIN_DOTSTAR_CLOCK)
+  for (uint8_t mask = 0x80; mask; mask >>= 1) {
+    digitalWrite(PIN_DOTSTAR_DATA, (value & mask) ? HIGH : LOW);
+    digitalWrite(PIN_DOTSTAR_CLOCK, HIGH);
+    digitalWrite(PIN_DOTSTAR_CLOCK, LOW);
+  }
+#else
+  (void)value;
+#endif
+}
+
+static void dotstar_off() {
+#if defined(PIN_DOTSTAR_DATA) && defined(PIN_DOTSTAR_CLOCK)
+  pinMode(PIN_DOTSTAR_DATA, OUTPUT);
+  pinMode(PIN_DOTSTAR_CLOCK, OUTPUT);
+  digitalWrite(PIN_DOTSTAR_DATA, LOW);
+  digitalWrite(PIN_DOTSTAR_CLOCK, LOW);
+
+  for (uint8_t i = 0; i < 4; i++) dotstar_write_byte(0x00);
+  dotstar_write_byte(0xE0);
+  dotstar_write_byte(0x00);
+  dotstar_write_byte(0x00);
+  dotstar_write_byte(0x00);
+  dotstar_write_byte(0xFF);
+
+  digitalWrite(PIN_DOTSTAR_DATA, LOW);
+  digitalWrite(PIN_DOTSTAR_CLOCK, LOW);
+#endif
+}
+
+static void qspi_flash_deep_power_down() {
+#if defined(PIN_QSPI_CS) && defined(PIN_QSPI_SCK) && defined(PIN_QSPI_IO0)
+  pinMode(PIN_QSPI_CS, OUTPUT);
+  pinMode(PIN_QSPI_SCK, OUTPUT);
+  pinMode(PIN_QSPI_IO0, OUTPUT);
+  digitalWrite(PIN_QSPI_CS, HIGH);
+  digitalWrite(PIN_QSPI_SCK, LOW);
+  digitalWrite(PIN_QSPI_IO0, LOW);
+  delayMicroseconds(2);
+
+  digitalWrite(PIN_QSPI_CS, LOW);
+  delayMicroseconds(1);
+
+  const uint8_t command = 0xB9;
+  for (uint8_t mask = 0x80; mask; mask >>= 1) {
+    digitalWrite(PIN_QSPI_IO0, (command & mask) ? HIGH : LOW);
+    digitalWrite(PIN_QSPI_SCK, HIGH);
+    delayMicroseconds(1);
+    digitalWrite(PIN_QSPI_SCK, LOW);
+    delayMicroseconds(1);
+  }
+
+  digitalWrite(PIN_QSPI_CS, HIGH);
+  delayMicroseconds(5);
+  digitalWrite(PIN_QSPI_IO0, LOW);
+
+#if defined(PIN_QSPI_IO1)
+  nrf_gpio_cfg_default(g_ADigitalPinMap[PIN_QSPI_IO1]);
+#endif
+#if defined(PIN_QSPI_IO2)
+  nrf_gpio_cfg_default(g_ADigitalPinMap[PIN_QSPI_IO2]);
+#endif
+#if defined(PIN_QSPI_IO3)
+  nrf_gpio_cfg_default(g_ADigitalPinMap[PIN_QSPI_IO3]);
+#endif
+#endif
+}
+
+static void board_power_cleanup() {
+  if (!CFG.board_power_cleanup) return;
+
+#ifdef NRF_POWER
+  NRF_POWER->DCDCEN = POWER_DCDCEN_DCDCEN_Enabled;
+#ifdef POWER_DCDCEN0_DCDCEN_Enabled
+  NRF_POWER->DCDCEN0 = POWER_DCDCEN0_DCDCEN_Enabled;
+#endif
+#endif
+
+  dotstar_off();
+  qspi_flash_deep_power_down();
+
+#ifdef NRF_SAADC
+  NRF_SAADC->TASKS_STOP = 1;
+  NRF_SAADC->ENABLE = 0;
+#endif
+
+#ifdef NRF_USBD
+  if (!CFG.debug_enable && CFG.usb_disable_when_not_debug) {
+    NRF_USBD->USBPULLUP = 0;
+    NRF_USBD->ENABLE = 0;
+    NVIC_DisableIRQ(USBD_IRQn);
+  }
+#endif
+}
+
 static void adxl_int1_isr() {
   irq_isr++;
   acc_irq_flag = true;
@@ -401,6 +529,11 @@ static void adxl_int1_isr() {
 // BLE (scan + dedup)
 // ===============================
 static bool ble_scanning = false;
+static bool ble_stack_started = false;
+static bool softdevice_active = false;
+static volatile bool ble_resume_allowed = false;
+static volatile uint32_t ble_resume_suppressed = 0;
+static volatile uint32_t ble_resume_fail = 0;
 
 struct BleQueued {
   uint32_t ms;
@@ -488,7 +621,12 @@ static void scan_callback(ble_gap_evt_adv_report_t* report) {
 
   uint32_t now = millis();
   (void)ble_queue_push(now, mac, rssi);
-  Bluefruit.Scanner.resume();
+
+  if (ble_resume_allowed && in_window(now, CFG.ble_period_ms, CFG.ble_window_ms)) {
+    if (!Bluefruit.Scanner.resume()) ble_resume_fail++;
+  } else {
+    ble_resume_suppressed++;
+  }
 }
 
 static void ble_process_queue() {
@@ -512,12 +650,56 @@ static uint16_t ms_to_scan_units_0p625(uint32_t ms) {
   return (uint16_t)units;
 }
 
+static bool ble_begin_stack() {
+  if (ble_stack_started) return true;
+
+  Bluefruit.autoConnLed(CFG.ble_conn_led_enabled && !sd_startup_failed);
+  bool ok = false;
+  if (CFG.ble_central_only) {
+    Bluefruit.configCentralBandwidth(BANDWIDTH_LOW);
+    ok = Bluefruit.begin(0, 1);
+  } else {
+    ok = Bluefruit.begin();
+  }
+  if (!ok) return false;
+
+  softdevice_active = true;
+  ble_stack_started = true;
+  Bluefruit.autoConnLed(CFG.ble_conn_led_enabled && !sd_startup_failed);
+  Bluefruit.setTxPower(CFG.ble_tx_power_dbm);
+  Bluefruit.setName("Logger");
+  status_led_set(sd_startup_failed);
+  return true;
+}
+
+static void ble_shutdown_stack() {
+  if (!ble_stack_started) return;
+
+  ble_resume_allowed = false;
+  if (ble_scanning) {
+    Bluefruit.Scanner.stop();
+    ble_scanning = false;
+  }
+
+#if defined(SOFTDEVICE_PRESENT)
+  uint8_t sd_enabled = 0;
+  (void)sd_softdevice_is_enabled(&sd_enabled);
+  if (sd_enabled) {
+    (void)sd_softdevice_disable();
+  }
+  NVIC_DisableIRQ(SD_EVT_IRQn);
+#endif
+
+  ble_stack_started = false;
+  softdevice_active = false;
+}
+
 static void ble_start_scan() {
+  if (!ble_begin_stack()) return;
   if (ble_scanning) return;
-  ble_scanning = true;
 
   Bluefruit.Scanner.setRxCallback(scan_callback);
-  Bluefruit.Scanner.restartOnDisconnect(true);
+  Bluefruit.Scanner.restartOnDisconnect(false);
   Bluefruit.Scanner.filterRssi(-100);
 
   float duty = CFG.ble_scan_duty;
@@ -537,13 +719,21 @@ static void ble_start_scan() {
 
   Bluefruit.Scanner.setInterval(interval_units, window_units);
   Bluefruit.Scanner.useActiveScan(false);
-  Bluefruit.Scanner.start(0);
+  ble_resume_allowed = true;
+  if (Bluefruit.Scanner.start(0)) {
+    ble_scanning = true;
+  } else {
+    ble_resume_allowed = false;
+    ble_scanning = false;
+  }
 }
 
 static void ble_stop_scan() {
-  if (!ble_scanning) return;
+  ble_resume_allowed = false;
+  if (!ble_stack_started && !ble_scanning) return;
+
   ble_scanning = false;
-  Bluefruit.Scanner.stop();
+  (void)Bluefruit.Scanner.stop();
 }
 
 // ===============================
@@ -822,6 +1012,15 @@ static void gps_hold_rx_wake_idle() {
 #endif
 }
 
+static void gps_release_uart_pins() {
+#if defined(PIN_SERIAL1_TX)
+  pinMode(PIN_SERIAL1_TX, INPUT);
+#endif
+#if defined(PIN_SERIAL1_RX)
+  pinMode(PIN_SERIAL1_RX, INPUT);
+#endif
+}
+
 // SAM-M10Q software standby: use backup + force for minimum power, then stop UART locally.
 static void gps_enter_backup_sleep(bool forceRefresh = false) {
   if (!CFG.gps_enabled) return;
@@ -842,7 +1041,8 @@ static void gps_enter_backup_sleep(bool forceRefresh = false) {
 
   // Important: stop UART so RX doesn't keep MCU awake
   GPS_SERIAL.end();
-  gps_hold_rx_wake_idle();
+  if (CFG.gps_release_uart_pins_after_sleep) gps_release_uart_pins();
+  else gps_hold_rx_wake_idle();
 
   gps_last_sleep_req_ms = millis();
   gps_sleeping = true;
@@ -1024,12 +1224,25 @@ static bool ensure_headers() {
 static bool write_ring_event_to_sd(uint8_t type, uint8_t len, const uint8_t* payload, bool& wrote_event) {
   wrote_event = false;
 
-  if (type == EVT_ACC && len == 16) {
-    uint32_t ms; float x, y, z;
+  if (type == EVT_ACC && (len == 10 || len == 16)) {
+    uint32_t ms;
+    float x, y, z;
     memcpy(&ms, payload + 0, 4);
-    memcpy(&x,  payload + 4, 4);
-    memcpy(&y,  payload + 8, 4);
-    memcpy(&z,  payload + 12,4);
+
+    if (len == 10) {
+      int16_t rx, ry, rz;
+      memcpy(&rx, payload + 4, 2);
+      memcpy(&ry, payload + 6, 2);
+      memcpy(&rz, payload + 8, 2);
+      const float scale_g = 0.0039f;
+      x = rx * scale_g;
+      y = ry * scale_g;
+      z = rz * scale_g;
+    } else {
+      memcpy(&x, payload + 4, 4);
+      memcpy(&y, payload + 8, 4);
+      memcpy(&z, payload + 12,4);
+    }
 
     uint32_t pos = fAcc.curPosition();
     fAcc.clearWriteError();
@@ -1090,6 +1303,7 @@ static bool write_ring_event_to_sd(uint8_t type, uint8_t len, const uint8_t* pay
 static bool flush_ring_burst(uint32_t& wrote_events_out) {
   wrote_events_out = 0;
   if (!sd_ok) return false;
+  if (CFG.sd_retry_backoff_ms > 0 && (int32_t)(millis() - sd_next_retry_ms) < 0) return false;
   if (RB.used == 0) return true;
 
   if (!sd_init_open_files()) {
@@ -1265,7 +1479,6 @@ static void dedup_init() {
 static uint32_t t_last_status = 0;
 static uint32_t t_last_gps_trigger = 0;
 static bool first_data_flush_done = false;
-static bool softdevice_active = false;
 
 static void sleep_when_idle();
 
@@ -1295,6 +1508,18 @@ static void apply_power_test_config() {
 
 #if POWER_TEST_MODE == POWER_TEST_GPS_ASLEEP_NO_ACC
   CFG.acc_enabled = false;
+#endif
+
+#if POWER_TEST_MODE == POWER_TEST_GPS_STANDBY_RELEASE_UART
+  CFG.gps_release_uart_pins_after_sleep = true;
+  CFG.gps_sleep_refresh_ms = 0;
+#endif
+
+#if POWER_TEST_MODE == POWER_TEST_GPS_GATE_ACC_BLE_SD_3MIN
+  CFG.gps_enabled = false;
+  CFG.gps_release_uart_pins_after_sleep = true;
+  CFG.gps_sleep_refresh_ms = 0;
+  CFG.flush_first_ms = 180000;
 #endif
 }
 
@@ -1361,15 +1586,8 @@ static void print_status() {
 
 // CPU sleep primitive
 static void sleep_when_idle() {
-#if defined(SOFTDEVICE_PRESENT)
-  if (softdevice_active) {
-    (void)sd_app_evt_wait();
-    return;
-  }
-#else
   (void)softdevice_active;
-#endif
-  __WFE();
+  waitForEvent();
 }
 
 // ===============================
@@ -1377,6 +1595,12 @@ static void sleep_when_idle() {
 // ===============================
 void setup() {
   status_led_init();
+
+#if POWER_TEST_MODE == POWER_TEST_GPS_GATE_ACC_BLE_SD_3MIN
+  CFG.gps_release_uart_pins_after_sleep = true;
+  CFG.gps_sleep_refresh_ms = 0;
+  power_test_gps_standby_setup();
+#endif
 
 #if POWER_TEST_MODE == POWER_TEST_LOGGER_GPS_ASLEEP || \
     POWER_TEST_MODE == POWER_TEST_GPS_ASLEEP_NO_SD || \
@@ -1387,20 +1611,23 @@ void setup() {
 
   apply_power_test_config();
 
-#if POWER_TEST_MODE == POWER_TEST_MCU_IDLE_ONLY
-  return;
-#elif POWER_TEST_MODE == POWER_TEST_GPS_STANDBY_ONLY
-  power_test_gps_standby_setup();
-  return;
-#endif
-
   if (CFG.debug_enable) {
     Serial.begin(115200);
     delay(100);
   }
 
+  board_power_cleanup();
+
+#if POWER_TEST_MODE == POWER_TEST_MCU_IDLE_ONLY
+  return;
+#elif POWER_TEST_MODE == POWER_TEST_GPS_STANDBY_ONLY || POWER_TEST_MODE == POWER_TEST_GPS_STANDBY_RELEASE_UART
+  power_test_gps_standby_setup();
+  return;
+#endif
+
   // I2C
   Wire.begin();
+  Wire.setClock(CFG.i2c_hz);
 
   ring_init_dynamic();
   dedup_init();
@@ -1424,13 +1651,9 @@ void setup() {
 
   // BLE
   if (CFG.ble_enabled) {
-    if (sd_startup_failed) Bluefruit.autoConnLed(false);
-    Bluefruit.begin();
-    softdevice_active = true;
-    if (sd_startup_failed) Bluefruit.autoConnLed(false);
-    Bluefruit.setTxPower(CFG.ble_tx_power_dbm);
-    Bluefruit.setName("Logger");
-    status_led_set(sd_startup_failed);
+    if (!CFG.ble_disable_stack_between_windows) {
+      (void)ble_begin_stack();
+    }
   }
 
   // GPS
@@ -1457,7 +1680,9 @@ void setup() {
 }
 
 void loop() {
-#if POWER_TEST_MODE == POWER_TEST_MCU_IDLE_ONLY || POWER_TEST_MODE == POWER_TEST_GPS_STANDBY_ONLY
+#if POWER_TEST_MODE == POWER_TEST_MCU_IDLE_ONLY || \
+    POWER_TEST_MODE == POWER_TEST_GPS_STANDBY_ONLY || \
+    POWER_TEST_MODE == POWER_TEST_GPS_STANDBY_RELEASE_UART
   power_test_idle_loop();
   return;
 #endif
@@ -1471,7 +1696,12 @@ void loop() {
     if (window_id != dedup_window_id) dedup_reset(window_id);
     if (!ble_scanning) ble_start_scan();
   } else {
-    if (ble_scanning) ble_stop_scan();
+    static uint32_t t_last_ble_force_stop = 0;
+    if (ble_scanning || (ble_stack_started && (uint32_t)(now - t_last_ble_force_stop) >= 250)) {
+      t_last_ble_force_stop = now;
+      ble_stop_scan();
+    }
+    if (CFG.ble_disable_stack_between_windows) ble_shutdown_stack();
   }
   if (CFG.ble_enabled) ble_process_queue();
   if (sd_startup_failed) status_led_set(true);
@@ -1497,17 +1727,20 @@ void loop() {
   }
 
   // 4) Flush requests
-  if (RB.used >= RB.emerg_th && RB.emerg_th > 0) request_flush(FLUSH_EMERG);
-  else if (RB.used >= RB.normal_th && RB.normal_th > 0) request_flush(FLUSH_NORMAL);
+  bool sd_retry_waiting = (CFG.sd_retry_backoff_ms > 0 && (int32_t)(now - sd_next_retry_ms) < 0);
+  if (!sd_retry_waiting) {
+    if (RB.used >= RB.emerg_th && RB.emerg_th > 0) request_flush(FLUSH_EMERG);
+    else if (RB.used >= RB.normal_th && RB.normal_th > 0) request_flush(FLUSH_NORMAL);
+  }
 
   // FAILSAFE since last successful flush done
-  if (!first_data_flush_done && CFG.flush_first_ms > 0) {
+  if (!sd_retry_waiting && !first_data_flush_done && CFG.flush_first_ms > 0) {
     if (RB.used > 0 && (uint32_t)(now - t_last_flush_done) >= CFG.flush_first_ms) {
       request_flush(FLUSH_FAILSAFE);
     }
   }
 
-  if (CFG.flush_failsafe_ms > 0) {
+  if (!sd_retry_waiting && CFG.flush_failsafe_ms > 0) {
     if ((uint32_t)(now - t_last_flush_done) >= CFG.flush_failsafe_ms) {
       if (RB.used > 0) request_flush(FLUSH_FAILSAFE);
     }
@@ -1520,11 +1753,18 @@ void loop() {
 
     if (allow) {
       uint32_t wrote = 0;
+      uint32_t sd_fails_before = sd_write_fail;
       bool done = flush_ring_burst(wrote);
+      bool sd_failed = (sd_write_fail != sd_fails_before);
 
       if (done || (wrote > 0 && RB.used < RB.normal_th)) {
         t_last_flush_done = millis();
         first_data_flush_done = true;
+      }
+
+      if (sd_failed) {
+        sd_next_retry_ms = millis() + CFG.sd_retry_backoff_ms;
+        flush_requested = false;
       }
 
       if (CFG.debug_enable && wrote > 0 && (done || flush_reason == FLUSH_EMERG)) {

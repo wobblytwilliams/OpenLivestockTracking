@@ -1,0 +1,209 @@
+mainmenu "Open Livestock GPS Zephyr Logger"
+
+menu "Open Livestock GPS options"
+
+config OLG_ACC_ENABLE
+	bool "Enable ADXL345 accelerometer"
+	default y
+
+config OLG_ACC_ODR_MILLIHZ
+	int "Accelerometer output data rate in millihertz"
+	default 12500
+
+config OLG_ACC_FIFO_WATERMARK
+	int "ADXL345 FIFO watermark sample count"
+	default 25
+	range 1 31
+
+config OLG_ACC_I2C_ADDR_PRIMARY
+	hex "Primary ADXL345 I2C address"
+	default 0x53
+
+config OLG_ACC_I2C_ADDR_SECONDARY
+	hex "Secondary ADXL345 I2C address"
+	default 0x1d
+
+config OLG_RING_BYTES
+	int "RAM ring buffer size in bytes"
+	default 32768
+
+config OLG_RING_NORMAL_THRESHOLD_PERCENT
+	int "Ring buffer normal flush threshold percent"
+	default 95
+	range 0 100
+
+config OLG_RING_EMERG_THRESHOLD_PERCENT
+	int "Ring buffer emergency flush threshold percent"
+	default 98
+	range 0 100
+
+config OLG_BLE_ENABLE
+	bool "Enable BLE observer scanner"
+	default y
+	depends on BT
+
+config OLG_BLE_PERIOD_MS
+	int "BLE scan period in milliseconds"
+	default 60000
+
+config OLG_BLE_WINDOW_MS
+	int "BLE scan window duration in milliseconds"
+	default 10000
+
+config OLG_BLE_SCAN_INTERVAL_MS
+	int "BLE scan interval in milliseconds"
+	default 100
+
+config OLG_BLE_SCAN_DUTY_PERMILLE
+	int "BLE scan duty within scan interval, in per-mille"
+	default 100
+	range 1 1000
+
+config OLG_BLE_DISABLE_STACK_BETWEEN_WINDOWS
+	bool "Disable Bluetooth stack outside scan windows"
+	default n
+
+config OLG_GPS_ENABLE
+	bool "Enable GPS UART/NMEA logger"
+	default n
+	depends on SERIAL
+
+config OLG_GPS_INTERVAL_MS
+	int "GPS attempt interval in milliseconds"
+	default 180000
+	depends on OLG_GPS_ENABLE
+
+config OLG_GPS_TIMEOUT_MS
+	int "GPS attempt timeout in milliseconds"
+	default 15000
+	depends on OLG_GPS_ENABLE
+
+config OLG_GPS_BAUD
+	int "GPS UART baud rate"
+	default 9600
+	depends on OLG_GPS_ENABLE
+
+config OLG_GPS_MIN_SATS
+	int "Minimum satellites before accepting a GPS fix"
+	default 4
+	range 0 32
+	depends on OLG_GPS_ENABLE
+
+config OLG_GPS_MIN_HDOP_CENTI
+	int "Maximum accepted HDOP multiplied by 100"
+	default 250
+	depends on OLG_GPS_ENABLE
+
+config OLG_GPS_BACKUP_SLEEP_ENABLE
+	bool "Request SAM-M10Q backup sleep between GPS attempts"
+	default y
+	depends on OLG_GPS_ENABLE
+
+config OLG_GPS_TX_IDLE_HIGH
+	bool "Hold MCU GPS TX high after UART suspend"
+	default y
+	depends on OLG_GPS_ENABLE
+
+config OLG_GPS_WAKE_SETTLE_MS
+	int "GPS wake settle delay in milliseconds"
+	default 250
+	depends on OLG_GPS_ENABLE
+
+config OLG_GPS_SLEEP_REFRESH_MS
+	int "GPS backup sleep refresh period in milliseconds"
+	default 30000
+	depends on OLG_GPS_ENABLE
+
+config OLG_GPS_POLL_BYTE_BUDGET
+	int "Maximum GPS UART bytes processed per service pass"
+	default 96
+	range 1 512
+	depends on OLG_GPS_ENABLE
+
+config OLG_SD_ENABLE
+	bool "Enable SD/FatFs CSV flush"
+	default n
+	depends on SPI && DISK_ACCESS && FILE_SYSTEM && FAT_FILESYSTEM_ELM
+
+config OLG_SD_STARTUP_CHECK
+	bool "Mount SD and create CSV headers during startup"
+	default y
+	depends on OLG_SD_ENABLE
+
+config OLG_SD_CLOSE_BETWEEN_FLUSHES
+	bool "Close files and unmount SD between flush bursts"
+	default y
+	depends on OLG_SD_ENABLE
+
+config OLG_SD_SEND_CMD0_ON_SLEEP
+	bool "Send CMD0 by GPIO bit-bang before releasing SD bus"
+	default y
+	depends on OLG_SD_ENABLE
+
+config OLG_SD_RELEASE_SPI_PINS_ON_SLEEP
+	bool "Drive SD SPI pins to low-power states after writes"
+	default y
+	depends on OLG_SD_ENABLE
+
+config OLG_SD_SYNC_EACH_LINE
+	bool "Sync each CSV line instead of syncing on close"
+	default n
+	depends on OLG_SD_ENABLE
+
+config OLG_SD_FLUSH_FIRST_MS
+	int "First failsafe SD flush delay in milliseconds"
+	default 0
+	depends on OLG_SD_ENABLE
+
+config OLG_SD_FLUSH_FAILSAFE_MS
+	int "Recurring failsafe SD flush delay in milliseconds"
+	default 900000
+	depends on OLG_SD_ENABLE
+
+config OLG_SD_FLUSH_MAX_EVENTS_BURST
+	int "Maximum ring events to write per SD service burst"
+	default 200
+	range 1 2000
+	depends on OLG_SD_ENABLE
+
+config OLG_SD_RETRY_BACKOFF_MS
+	int "SD retry backoff after a write/mount failure"
+	default 300000
+	depends on OLG_SD_ENABLE
+
+config OLG_SD_BLOCK_FLUSH_DURING_GPS
+	bool "Block non-emergency SD flushes during GPS attempts"
+	default y
+	depends on OLG_SD_ENABLE
+
+config OLG_STATUS_LED
+	bool "Enable visible status LED diagnostics"
+	default n
+
+config OLG_ACC_DIAG_LED
+	bool "Pulse status LED after ADXL345 FIFO drains"
+	default n
+	depends on OLG_ACC_ENABLE && OLG_STATUS_LED
+
+config OLG_ACC_DIAG_LED_MS
+	int "ADXL345 FIFO diagnostic LED pulse width in milliseconds"
+	default 20
+	range 1 1000
+	depends on OLG_ACC_DIAG_LED
+
+config OLG_ACC_DIAG_POLL_MS
+	int "ADXL345 FIFO diagnostic polling interval in milliseconds"
+	default 0
+	range 0 60000
+	depends on OLG_ACC_ENABLE
+	help
+	  When non-zero, periodically submit a FIFO drain even if the ADXL345
+	  interrupt pin does not fire. This is only for bring-up diagnostics.
+
+config OLG_MAIN_IDLE_MAX_MS
+	int "Maximum main-loop sleep interval"
+	default 60000
+
+endmenu
+
+source "Kconfig.zephyr"

@@ -1,0 +1,101 @@
+#include <zephyr/dt-bindings/gpio/gpio.h>
+
+/ {
+	aliases {
+		olg-adxl-int = &olg_adxl_int;
+		olg-gps-tx = &olg_gps_tx;
+		olg-sd-slot = &sdhc0;
+		olg-sd-cs = &olg_sd_cs;
+		olg-sd-sck = &olg_sd_sck;
+		olg-sd-mosi = &olg_sd_mosi;
+		olg-sd-miso = &olg_sd_miso;
+	};
+
+	olg_adxl_ints {
+		compatible = "gpio-keys";
+
+		olg_adxl_int: adxl_int {
+			gpios = <&gpio0 12 GPIO_ACTIVE_HIGH>; /* ItsyBitsy D13 / P0.12 */
+			label = "ADXL345 INT1";
+		};
+	};
+
+	olg_gps_pins {
+		compatible = "gpio-keys";
+
+		olg_gps_tx: gps_tx {
+			gpios = <&gpio0 24 GPIO_ACTIVE_HIGH>; /* ItsyBitsy D1 / GPS RX */
+			label = "GPS UART TX idle hold";
+		};
+	};
+
+	olg_sd_pins {
+		compatible = "gpio-keys";
+
+		olg_sd_cs: sd_cs {
+			gpios = <&gpio0 5 GPIO_ACTIVE_LOW>; /* ItsyBitsy D10 */
+			label = "SD CS";
+		};
+
+		olg_sd_sck: sd_sck {
+			gpios = <&gpio0 13 GPIO_ACTIVE_HIGH>; /* ItsyBitsy D25 */
+			label = "SD SCK";
+		};
+
+		olg_sd_mosi: sd_mosi {
+			gpios = <&gpio0 15 GPIO_ACTIVE_HIGH>; /* ItsyBitsy D24 */
+			label = "SD MOSI";
+		};
+
+		olg_sd_miso: sd_miso {
+			gpios = <&gpio0 20 GPIO_ACTIVE_HIGH>; /* ItsyBitsy D23 */
+			label = "SD MISO";
+		};
+	};
+};
+
+&i2c0 {
+	status = "okay";
+	clock-frequency = <400000>;
+};
+
+&uart0 {
+	status = "okay";
+	current-speed = <9600>;
+};
+
+&spi1 {
+	status = "okay";
+	cs-gpios = <&gpio0 5 GPIO_ACTIVE_LOW>;
+
+	sdhc0: sdhc@0 {
+		compatible = "zephyr,sdhc-spi-slot";
+		reg = <0>;
+		status = "okay";
+		spi-max-frequency = <12000000>;
+		power-delay-ms = <5>;
+
+		mmc {
+			compatible = "zephyr,sdmmc-disk";
+			disk-name = "SD";
+			status = "okay";
+		};
+	};
+};
+
+/* Keep the power-test app quiet and avoid board extras where possible. */
+&adc {
+	status = "disabled";
+};
+
+&usbd {
+	status = "disabled";
+};
+
+&spi2 {
+	status = "disabled"; /* DotStar SPI */
+};
+
+&qspi {
+	status = "disabled";
+};
