@@ -14,7 +14,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   build:
@@ -52,3 +52,37 @@ jobs:
           name: OpenLivestockGPS-ZephyrLogger-UF2
           path: build/zephyrlogger/zephyr/zephyr.uf2
           if-no-files-found: error
+
+      - name: Prepare Release Files
+        if: github.event_name != 'pull_request'
+        run: |
+          mkdir -p release
+          cp build/zephyrlogger/zephyr/zephyr.uf2 release/zephyr.uf2
+          (cd release && sha256sum zephyr.uf2 > zephyr.uf2.sha256)
+
+      - name: Publish Latest UF2 Release
+        if: github.event_name != 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: zephyrlogger-latest
+          RELEASE_TITLE: ZephyrLogger Latest UF2
+        run: |
+          git tag -f "$TAG_NAME" "$GITHUB_SHA"
+          git push origin "refs/tags/$TAG_NAME" --force
+
+          if gh release view "$TAG_NAME" >/dev/null 2>&1; then
+            gh release edit "$TAG_NAME" \
+              --title "$RELEASE_TITLE" \
+              --notes "Automatically built ZephyrLogger UF2 from commit $GITHUB_SHA." \
+              --latest
+          else
+            gh release create "$TAG_NAME" \
+              --title "$RELEASE_TITLE" \
+              --notes "Automatically built ZephyrLogger UF2 from commit $GITHUB_SHA." \
+              --latest
+          fi
+
+          gh release upload "$TAG_NAME" \
+            release/zephyr.uf2 \
+            release/zephyr.uf2.sha256 \
+            --clobber

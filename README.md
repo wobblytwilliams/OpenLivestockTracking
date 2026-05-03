@@ -54,24 +54,21 @@ field deployment.
 
 ## Install The ZephyrLogger UF2
 
-The easiest way to install the logger is to use the UF2 built by GitHub Actions.
-You do not need Zephyr, Arduino, or any local build tools for this path.
+The easiest way to install the logger is to download the prebuilt UF2 file.
+You do not need Zephyr, Arduino, GitHub Actions, or any local build tools for
+this path.
 
-1. Open the
-   [Build ZephyrLogger UF2](https://github.com/wobblytwilliams/OpenAgLivestockTracking/actions/workflows/zephyrlogger-uf2.yml)
-   workflow.
-2. Choose the latest successful run.
-3. Download the `OpenLivestockGPS-ZephyrLogger-UF2` artifact.
-4. Unzip the artifact to get `zephyr.uf2`.
-5. Double-tap reset on the ItsyBitsy so the `ITSY840BOOT` drive appears.
-6. Copy `zephyr.uf2` onto `ITSY840BOOT`.
+1. Download
+   [`zephyr.uf2`](https://github.com/wobblytwilliams/OpenAgLivestockTracking/releases/download/zephyrlogger-latest/zephyr.uf2).
+2. Double-tap reset on the ItsyBitsy so the `ITSY840BOOT` drive appears.
+3. Copy `zephyr.uf2` onto `ITSY840BOOT`.
 
 After the copy finishes, the board reboots into the new firmware. On first boot,
 the firmware creates `CONFIG.TXT` and the CSV files on the microSD card.
 
-The badge at the top of this README links to the same workflow. If there is no
-successful run yet, open the workflow and use **Run workflow** to build one from
-`main`.
+The latest build files are also listed on the
+[ZephyrLogger Latest UF2 release page](https://github.com/wobblytwilliams/OpenAgLivestockTracking/releases/tag/zephyrlogger-latest).
+GitHub Actions updates that release after successful builds from `main`.
 
 ## Build The Firmware Locally
 
