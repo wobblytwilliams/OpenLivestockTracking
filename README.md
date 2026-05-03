@@ -1,4 +1,4 @@
-# OpenLivestockGPS
+# OpenLivestockTracking
 
 [![Build ZephyrLogger UF2](https://github.com/wobblytwilliams/OpenAgLivestockTracking/actions/workflows/zephyrlogger-uf2.yml/badge.svg)](https://github.com/wobblytwilliams/OpenAgLivestockTracking/actions/workflows/zephyrlogger-uf2.yml)
 
