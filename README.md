@@ -6,6 +6,8 @@ OpenLivestockGPS is store-on-board firmware for livestock loggers. The
 logger records movement, GPS position, and nearby Bluetooth devices to
 CSV files on a microSD card so the data can be analysed after the deployment.
 
+Maintainer: Dr Thomas Williams
+
 The repository now keeps two production firmware code bases:
 
 - `Firmware/ZephyrLogger`: the current low-power field-test firmware for the
@@ -173,6 +175,12 @@ Use `ArduinoLogger` if you want to tinker and you are confident with the Arduino
 toolchain. It writes the same CSV style but is configured in code rather than by
 `CONFIG.TXT`. Power is significantly higher because of SD card latching and the
 difficulty of getting the Arduino stack into deep sleep.
+
+## License
+
+This project is licensed under the BSD 3-Clause License. You may use, modify,
+and redistribute it, but you must retain the copyright and license notice so Dr
+Thomas Williams is acknowledged. See [LICENSE](LICENSE).
 
 ## Typical Field Workflow
 
