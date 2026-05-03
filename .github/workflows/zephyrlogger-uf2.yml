@@ -1,0 +1,54 @@
+name: Build ZephyrLogger UF2
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/zephyrlogger-uf2.yml"
+      - "Firmware/ZephyrLogger/**"
+  pull_request:
+    paths:
+      - ".github/workflows/zephyrlogger-uf2.yml"
+      - "Firmware/ZephyrLogger/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build ItsyBitsy nRF52840 UF2
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set Up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Set Up Zephyr
+        uses: zephyrproject-rtos/action-zephyr-setup@v1
+        with:
+          base-path: Firmware
+          app-path: ZephyrLogger
+          toolchains: arm-zephyr-eabi
+
+      - name: Build ZephyrLogger
+        working-directory: Firmware
+        run: |
+          west build \
+            -b adafruit_itsybitsy/nrf52840 \
+            ZephyrLogger \
+            -d ../build/zephyrlogger \
+            --pristine always
+
+      - name: Upload UF2
+        uses: actions/upload-artifact@v7
+        with:
+          name: OpenLivestockGPS-ZephyrLogger-UF2
+          path: build/zephyrlogger/zephyr/zephyr.uf2
+          if-no-files-found: error

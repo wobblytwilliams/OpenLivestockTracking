@@ -71,6 +71,11 @@ build/zephyr/zephyr.uf2
 
 onto that drive.
 
+GitHub Actions also builds the ZephyrLogger UF2 on pushes to `main`, pull
+requests that touch `Firmware/ZephyrLogger`, or manual workflow runs. Open the
+Actions tab, choose `Build ZephyrLogger UF2`, and download the
+`OpenLivestockGPS-ZephyrLogger-UF2` artifact from a successful run.
+
 ## Field Configuration
 
 On first boot, `ZephyrLogger` creates `CONFIG.TXT` on the SD card if it does not

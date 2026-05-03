@@ -14,6 +14,10 @@ west build -b adafruit_itsybitsy/nrf52840 .
 On Windows, build from a no-space app path if Zephyr has trouble with a cloud
 folder path such as `My Drive`.
 
+GitHub Actions builds the same UF2 from this app and uploads it as
+`OpenLivestockGPS-ZephyrLogger-UF2`. The workflow uses `west.yml` in this folder
+to pin the CI build to Zephyr `v4.4.0`.
+
 ## Runtime Config
 
 At startup the firmware mounts the SD card, creates `CONFIG.TXT` if missing,
