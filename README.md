@@ -1,5 +1,7 @@
 # OpenLivestockGPS
 
+[![Build ZephyrLogger UF2](https://github.com/wobblytwilliams/OpenAgLivestockTracking/actions/workflows/zephyrlogger-uf2.yml/badge.svg)](https://github.com/wobblytwilliams/OpenAgLivestockTracking/actions/workflows/zephyrlogger-uf2.yml)
+
 OpenLivestockGPS is store-on-board firmware for livestock loggers. The
 logger records movement, GPS position, and nearby Bluetooth devices to
 CSV files on a microSD card so the data can be analysed after the deployment.
@@ -73,8 +75,9 @@ onto that drive.
 
 GitHub Actions also builds the ZephyrLogger UF2 on pushes to `main`, pull
 requests that touch `Firmware/ZephyrLogger`, or manual workflow runs. Open the
-Actions tab, choose `Build ZephyrLogger UF2`, and download the
-`OpenLivestockGPS-ZephyrLogger-UF2` artifact from a successful run.
+[Build ZephyrLogger UF2](https://github.com/wobblytwilliams/OpenAgLivestockTracking/actions/workflows/zephyrlogger-uf2.yml)
+workflow and download the `OpenLivestockGPS-ZephyrLogger-UF2` artifact from a
+successful run.
 
 ## Field Configuration
 
@@ -117,6 +120,43 @@ The main knobs are:
 
 Invalid or missing values fall back to compiled defaults, so a typo should not
 stop the logger from starting.
+
+Set `acc_enabled`, `ble_enabled`, or `gps_enabled` to `false` to skip that
+subsystem for a deployment.
+
+## ZephyrLogger Behavior Notes
+
+- ACC uses ADXL345 FIFO stream mode and INT1 level-active handling. Production
+  firmware does not poll as a fallback.
+- The ACC FIFO watermark is an internal firmware setting. Field configuration
+  exposes sample rate and g range instead.
+- SD writes are bursty. Files are opened for startup/header checks and ring
+  flushes, then the card is closed, unmounted, deinitialized, and the SPI pins
+  are released.
+- The first failsafe data flush is after 3 minutes. Recurring failsafe flushes
+  are every 15 minutes.
+
+## ArduinoLogger Quick Start
+
+`Firmware/ArduinoLogger/ArduinoLogger.ino` is configured in code through the
+`Config` struct near the top of the sketch. It records the same three CSV files
+as ZephyrLogger, but it does not read `CONFIG.TXT`; changing settings requires
+editing the sketch and reflashing.
+
+The most useful ArduinoLogger fields are:
+
+- `acc_enabled`, `gps_enabled`, and `ble_enabled`
+- `acc_odr_hz` and `acc_range_g`
+- `ble_period_ms`, `ble_window_ms`, and `ble_scan_interval_ms`
+- `gps_interval_ms`, `gps_timeout_ms`, `gps_min_sats`, and `gps_min_hdop`
+- `flush_failsafe_ms` and SD low-power settings
+
+Open `ArduinoLogger.ino` in the Arduino IDE with the Adafruit nRF52 board
+package installed for the ItsyBitsy nRF52840. The sketch uses the Arduino
+`Wire`, `SPI`, `SdFat`, and Adafruit Bluefruit nRF52 libraries.
+
+Flash with the normal Arduino upload flow, or double-tap reset to enter the UF2
+bootloader if your Arduino setup produces a UF2 file.
 
 ## Choosing A Firmware
 
