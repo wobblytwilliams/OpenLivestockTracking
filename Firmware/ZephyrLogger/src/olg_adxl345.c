@@ -9,8 +9,8 @@
 #include <zephyr/pm/device.h>
 #include <zephyr/sys/atomic.h>
 
+#include "olg_config.h"
 #include "olg_ring.h"
-#include "olg_power.h"
 
 #define ADXL_DEVID_VALUE 0xe5
 
@@ -29,7 +29,10 @@
 #define INT_WATERMARK   BIT(1)
 
 #define DATA_FORMAT_FULL_RES BIT(3)
-#define DATA_FORMAT_16G      0x03
+#define DATA_FORMAT_RANGE_2G  0x00
+#define DATA_FORMAT_RANGE_4G  0x01
+#define DATA_FORMAT_RANGE_8G  0x02
+#define DATA_FORMAT_RANGE_16G 0x03
 #define POWER_CTL_MEASURE    BIT(3)
 #define FIFO_STREAM_MODE     0x80
 
@@ -39,12 +42,16 @@ static const struct device *const i2c_dev = DEVICE_DT_GET(DT_NODELABEL(i2c0));
 static const struct gpio_dt_spec int_gpio = GPIO_DT_SPEC_GET(ADXL_INT_NODE, gpios);
 static struct gpio_callback int_cb;
 static struct k_work drain_work;
-static struct k_work_delayable diag_poll_work;
 
 static uint8_t adxl_addr;
 static atomic_t sample_count;
 static atomic_t drain_count;
 static atomic_t i2c_failures;
+
+static int configure_fifo_interrupt(gpio_flags_t flags)
+{
+	return gpio_pin_interrupt_configure_dt(&int_gpio, flags);
+}
 
 static void resume_i2c(void)
 {
@@ -145,6 +152,33 @@ static uint8_t bw_rate_for_millihz(uint32_t mhz)
 	return 0x0f;
 }
 
+static uint8_t data_format_range_bits(uint8_t range_g)
+{
+	switch (range_g) {
+	case 2:
+		return DATA_FORMAT_RANGE_2G;
+	case 4:
+		return DATA_FORMAT_RANGE_4G;
+	case 8:
+		return DATA_FORMAT_RANGE_8G;
+	case 16:
+	default:
+		return DATA_FORMAT_RANGE_16G;
+	}
+}
+
+static uint8_t fifo_watermark(void)
+{
+	if (CONFIG_OLG_ACC_FIFO_WATERMARK < 1) {
+		return 1;
+	}
+	if (CONFIG_OLG_ACC_FIFO_WATERMARK > 31) {
+		return 31;
+	}
+
+	return CONFIG_OLG_ACC_FIFO_WATERMARK;
+}
+
 static int find_adxl(void)
 {
 	uint8_t devid = 0;
@@ -205,10 +239,9 @@ static void drain_fifo(struct k_work *work)
 	}
 
 	const uint32_t now = k_uptime_get_32();
+	const struct olg_config *cfg = olg_config_get();
 	const uint32_t sample_period_ms =
-		CONFIG_OLG_ACC_ODR_MILLIHZ > 0 ? (1000000U / CONFIG_OLG_ACC_ODR_MILLIHZ) : 0;
-
-	uint8_t samples_read = 0;
+		cfg->acc_odr_millihz > 0U ? (1000000U / cfg->acc_odr_millihz) : 0U;
 
 	for (uint8_t i = 0; i < entries; i++) {
 		int16_t x;
@@ -227,16 +260,12 @@ static void drain_fifo(struct k_work *work)
 
 		(void)olg_ring_push_acc(sample_ms, x, y, z);
 		atomic_inc(&sample_count);
-		samples_read++;
 	}
 
+	(void)read_regs(REG_INT_SOURCE, &src, 1);
 	atomic_inc(&drain_count);
-#if IS_ENABLED(CONFIG_OLG_ACC_DIAG_LED)
-	if (samples_read > 0) {
-		olg_power_pulse_status_led(CONFIG_OLG_ACC_DIAG_LED_MS);
-	}
-#endif
 	suspend_i2c();
+	(void)configure_fifo_interrupt(GPIO_INT_LEVEL_ACTIVE);
 }
 
 static void gpio_isr(const struct device *dev, struct gpio_callback *cb, uint32_t pins)
@@ -245,23 +274,18 @@ static void gpio_isr(const struct device *dev, struct gpio_callback *cb, uint32_
 	ARG_UNUSED(cb);
 	ARG_UNUSED(pins);
 
+	(void)configure_fifo_interrupt(GPIO_INT_DISABLE);
 	(void)k_work_submit(&drain_work);
-}
-
-static void diag_poll_fifo(struct k_work *work)
-{
-	ARG_UNUSED(work);
-
-	(void)k_work_submit(&drain_work);
-
-	if (CONFIG_OLG_ACC_DIAG_POLL_MS > 0) {
-		(void)k_work_reschedule(&diag_poll_work, K_MSEC(CONFIG_OLG_ACC_DIAG_POLL_MS));
-	}
 }
 
 int olg_adxl345_init(void)
 {
 	if (!IS_ENABLED(CONFIG_OLG_ACC_ENABLE)) {
+		return 0;
+	}
+
+	const struct olg_config *cfg = olg_config_get();
+	if (!cfg->acc_enabled) {
 		return 0;
 	}
 
@@ -278,24 +302,18 @@ int olg_adxl345_init(void)
 	}
 
 	k_work_init(&drain_work, drain_fifo);
-	k_work_init_delayable(&diag_poll_work, diag_poll_fifo);
 
-	uint8_t bw_rate = bw_rate_for_millihz(CONFIG_OLG_ACC_ODR_MILLIHZ);
+	uint8_t bw_rate = bw_rate_for_millihz(cfg->acc_odr_millihz);
 	if (bw_rate >= 0x07 && bw_rate <= 0x0c) {
 		bw_rate |= BIT(4);
 	}
 
-	uint8_t watermark = CONFIG_OLG_ACC_FIFO_WATERMARK;
-	if (watermark < 1) {
-		watermark = 1;
-	}
-	if (watermark > 31) {
-		watermark = 31;
-	}
+	uint8_t watermark = fifo_watermark();
 
 	err = write_reg(REG_POWER_CTL, 0x00);
 	err |= write_reg(REG_BW_RATE, bw_rate);
-	err |= write_reg(REG_DATA_FORMAT, DATA_FORMAT_FULL_RES | DATA_FORMAT_16G);
+	err |= write_reg(REG_DATA_FORMAT, DATA_FORMAT_FULL_RES |
+					      data_format_range_bits(cfg->acc_range_g));
 	err |= write_reg(REG_FIFO_CTL, FIFO_STREAM_MODE | watermark);
 	err |= write_reg(REG_INT_MAP, 0x00);
 	err |= write_reg(REG_INT_ENABLE, INT_WATERMARK | INT_OVERRUN);
@@ -321,12 +339,9 @@ int olg_adxl345_init(void)
 		return err;
 	}
 
-	err = gpio_pin_interrupt_configure_dt(&int_gpio, GPIO_INT_EDGE_RISING);
+	err = configure_fifo_interrupt(GPIO_INT_LEVEL_ACTIVE);
 	if (!err) {
 		(void)k_work_submit(&drain_work);
-		if (CONFIG_OLG_ACC_DIAG_POLL_MS > 0) {
-			(void)k_work_schedule(&diag_poll_work, K_MSEC(CONFIG_OLG_ACC_DIAG_POLL_MS));
-		}
 	}
 
 	suspend_i2c();

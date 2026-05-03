@@ -6,10 +6,12 @@
 
 #include "olg_adxl345.h"
 #include "olg_ble.h"
+#include "olg_config.h"
 #include "olg_gps.h"
 #include "olg_power.h"
 #include "olg_ring.h"
 #include "olg_sd.h"
+#include "olg_storage.h"
 #include "olg_time.h"
 
 static uint32_t min_u32(uint32_t a, uint32_t b)
@@ -39,24 +41,32 @@ static uint32_t bounded_idle_ms(uint32_t now_ms)
 int main(void)
 {
 	bool init_failed = false;
-
-	olg_time_init();
-	olg_ring_init();
+	bool storage_ready = false;
 
 	if (olg_power_init()) {
 		init_failed = true;
 	}
-	if (olg_adxl345_init()) {
+
+	olg_time_init();
+	olg_ring_init();
+	olg_config_init_defaults();
+
+	if (!init_failed && olg_storage_startup()) {
 		init_failed = true;
+	} else if (!init_failed) {
+		storage_ready = true;
 	}
-	if (olg_ble_init()) {
-		init_failed = true;
-	}
-	if (olg_gps_init()) {
-		init_failed = true;
-	}
-	if (olg_sd_init()) {
-		init_failed = true;
+
+	if (storage_ready) {
+		if (olg_adxl345_init()) {
+			init_failed = true;
+		}
+		if (olg_ble_init()) {
+			init_failed = true;
+		}
+		if (olg_gps_init()) {
+			init_failed = true;
+		}
 	}
 
 	if (init_failed) {
@@ -68,11 +78,14 @@ int main(void)
 	while (true) {
 		uint32_t now_ms = k_uptime_get_32();
 
-		olg_ble_service(now_ms);
-		olg_gps_service(now_ms);
-		olg_sd_service(now_ms);
+		if (storage_ready) {
+			olg_ble_service(now_ms);
+			olg_gps_service(now_ms);
+			olg_sd_service(now_ms);
+		}
 
-		olg_power_idle(bounded_idle_ms(k_uptime_get_32()));
+		olg_power_idle(storage_ready ? bounded_idle_ms(k_uptime_get_32()) :
+			       CONFIG_OLG_MAIN_IDLE_MAX_MS);
 	}
 
 	return 0;

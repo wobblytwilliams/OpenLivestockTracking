@@ -7,9 +7,11 @@ target_sources(app PRIVATE
   src/main.c
   src/olg_adxl345.c
   src/olg_ble.c
+  src/olg_config.c
   src/olg_gps.c
   src/olg_power.c
   src/olg_ring.c
   src/olg_sd.c
+  src/olg_storage.c
   src/olg_time.c
 )

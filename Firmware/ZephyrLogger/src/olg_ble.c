@@ -8,6 +8,7 @@
 #include <zephyr/sys/atomic.h>
 #include <zephyr/sys/util.h>
 
+#include "olg_config.h"
 #include "olg_ring.h"
 
 #if IS_ENABLED(CONFIG_BT) && IS_ENABLED(CONFIG_OLG_BLE_ENABLE)
@@ -47,15 +48,15 @@ static uint16_t scan_units_from_ms(uint32_t ms)
 
 static uint16_t configured_scan_window_units(void)
 {
-	uint32_t window_ms = (CONFIG_OLG_BLE_SCAN_INTERVAL_MS *
-			      CONFIG_OLG_BLE_SCAN_DUTY_PERMILLE) /
-			     1000U;
+	const struct olg_config *cfg = olg_config_get();
+	uint32_t interval_ms = cfg->ble_scan_interval_ms;
+	uint32_t window_ms = cfg->ble_scan_window_ms;
 
 	if (window_ms < 1U) {
 		window_ms = 1U;
 	}
-	if (window_ms > CONFIG_OLG_BLE_SCAN_INTERVAL_MS) {
-		window_ms = CONFIG_OLG_BLE_SCAN_INTERVAL_MS;
+	if (window_ms > interval_ms) {
+		window_ms = interval_ms;
 	}
 
 	return scan_units_from_ms(window_ms);
@@ -91,24 +92,10 @@ static int enable_bt_if_needed(void)
 	return 0;
 }
 
-static void disable_bt_if_requested(void)
-{
-	if (!IS_ENABLED(CONFIG_OLG_BLE_DISABLE_STACK_BETWEEN_WINDOWS) || !bt_enabled) {
-		return;
-	}
-
-	int err = bt_disable();
-	if (err) {
-		atomic_inc(&error_count);
-		return;
-	}
-
-	bt_enabled = false;
-}
-
 static void schedule_next_period(uint32_t now_ms)
 {
-	uint32_t period_ms = CONFIG_OLG_BLE_PERIOD_MS;
+	const struct olg_config *cfg = olg_config_get();
+	uint32_t period_ms = cfg->ble_period_ms;
 
 	if (period_ms < 1U) {
 		period_ms = 1U;
@@ -121,14 +108,15 @@ static void schedule_next_period(uint32_t now_ms)
 
 static void start_scan(uint32_t now_ms)
 {
-	uint32_t interval_ms = CONFIG_OLG_BLE_SCAN_INTERVAL_MS;
+	const struct olg_config *cfg = olg_config_get();
+	uint32_t interval_ms = cfg->ble_scan_interval_ms;
 
 	if (interval_ms < 1U) {
 		interval_ms = 1U;
 	}
 
 	if (enable_bt_if_needed()) {
-		next_scan_start_ms = now_ms + CONFIG_OLG_BLE_PERIOD_MS;
+		next_scan_start_ms = now_ms + cfg->ble_period_ms;
 		return;
 	}
 
@@ -145,13 +133,13 @@ static void start_scan(uint32_t now_ms)
 	int err = bt_le_scan_start(&params, scan_cb);
 	if (err && err != -EALREADY) {
 		atomic_inc(&error_count);
-		next_scan_start_ms = now_ms + CONFIG_OLG_BLE_PERIOD_MS;
+		next_scan_start_ms = now_ms + cfg->ble_period_ms;
 		return;
 	}
 
 	scanning = true;
-	scan_stop_ms = next_scan_start_ms + CONFIG_OLG_BLE_WINDOW_MS;
-	if (CONFIG_OLG_BLE_WINDOW_MS < 1U || time_reached(now_ms, scan_stop_ms)) {
+	scan_stop_ms = next_scan_start_ms + cfg->ble_window_ms;
+	if (cfg->ble_window_ms < 1U || time_reached(now_ms, scan_stop_ms)) {
 		scan_stop_ms = now_ms + 1U;
 	}
 
@@ -168,7 +156,6 @@ static void stop_scan(uint32_t now_ms)
 
 	scanning = false;
 	atomic_inc(&scan_stop_count);
-	disable_bt_if_requested();
 	schedule_next_period(now_ms);
 }
 #endif
@@ -181,13 +168,13 @@ int olg_ble_init(void)
 	atomic_clear(&error_count);
 
 #if IS_ENABLED(CONFIG_BT) && IS_ENABLED(CONFIG_OLG_BLE_ENABLE)
-	next_scan_start_ms = k_uptime_get_32() + CONFIG_OLG_BLE_PERIOD_MS;
-	scan_stop_ms = next_scan_start_ms + CONFIG_OLG_BLE_WINDOW_MS;
-
-	if (IS_ENABLED(CONFIG_OLG_BLE_DISABLE_STACK_BETWEEN_WINDOWS)) {
-		bt_enabled = false;
+	const struct olg_config *cfg = olg_config_get();
+	if (!cfg->ble_enabled) {
 		return 0;
 	}
+
+	next_scan_start_ms = k_uptime_get_32() + cfg->ble_period_ms;
+	scan_stop_ms = next_scan_start_ms + cfg->ble_window_ms;
 
 	return enable_bt_if_needed();
 #else
@@ -198,6 +185,11 @@ int olg_ble_init(void)
 void olg_ble_service(uint32_t now_ms)
 {
 #if IS_ENABLED(CONFIG_BT) && IS_ENABLED(CONFIG_OLG_BLE_ENABLE)
+	const struct olg_config *cfg = olg_config_get();
+	if (!cfg->ble_enabled) {
+		return;
+	}
+
 	if (scanning) {
 		if (time_reached(now_ms, scan_stop_ms)) {
 			stop_scan(now_ms);
@@ -216,6 +208,11 @@ void olg_ble_service(uint32_t now_ms)
 uint32_t olg_ble_ms_until_transition(uint32_t now_ms)
 {
 #if IS_ENABLED(CONFIG_BT) && IS_ENABLED(CONFIG_OLG_BLE_ENABLE)
+	const struct olg_config *cfg = olg_config_get();
+	if (!cfg->ble_enabled) {
+		return UINT32_MAX;
+	}
+
 	uint32_t target_ms = scanning ? scan_stop_ms : next_scan_start_ms;
 
 	if (time_reached(now_ms, target_ms)) {

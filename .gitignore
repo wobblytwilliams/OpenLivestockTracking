@@ -1,2 +1,3 @@
 .arduino-build/
+.vscode/
 Firmware/ZephyrLogger/build/

@@ -10,10 +10,21 @@ config OLG_ACC_ODR_MILLIHZ
 	int "Accelerometer output data rate in millihertz"
 	default 12500
 
+config OLG_ACC_RANGE_G
+	int "ADXL345 measurement range in g"
+	default 16
+	range 2 16
+	help
+	  Production CONFIG.TXT supports 2, 4, 8, and 16 g. Other values fall
+	  back to 16 g at runtime.
+
 config OLG_ACC_FIFO_WATERMARK
-	int "ADXL345 FIFO watermark sample count"
+	int "Internal ADXL345 FIFO watermark sample count"
 	default 25
 	range 1 31
+	help
+	  Compile-time queueing detail. Field firmware exposes sample rate and
+	  g range in CONFIG.TXT; the FIFO watermark stays internal.
 
 config OLG_ACC_I2C_ADDR_PRIMARY
 	hex "Primary ADXL345 I2C address"
@@ -58,10 +69,6 @@ config OLG_BLE_SCAN_DUTY_PERMILLE
 	int "BLE scan duty within scan interval, in per-mille"
 	default 100
 	range 1 1000
-
-config OLG_BLE_DISABLE_STACK_BETWEEN_WINDOWS
-	bool "Disable Bluetooth stack outside scan windows"
-	default n
 
 config OLG_GPS_ENABLE
 	bool "Enable GPS UART/NMEA logger"
@@ -125,11 +132,6 @@ config OLG_SD_ENABLE
 	default n
 	depends on SPI && DISK_ACCESS && FILE_SYSTEM && FAT_FILESYSTEM_ELM
 
-config OLG_SD_STARTUP_CHECK
-	bool "Mount SD and create CSV headers during startup"
-	default y
-	depends on OLG_SD_ENABLE
-
 config OLG_SD_CLOSE_BETWEEN_FLUSHES
 	bool "Close files and unmount SD between flush bursts"
 	default y
@@ -152,7 +154,7 @@ config OLG_SD_SYNC_EACH_LINE
 
 config OLG_SD_FLUSH_FIRST_MS
 	int "First failsafe SD flush delay in milliseconds"
-	default 0
+	default 180000
 	depends on OLG_SD_ENABLE
 
 config OLG_SD_FLUSH_FAILSAFE_MS
@@ -177,28 +179,8 @@ config OLG_SD_BLOCK_FLUSH_DURING_GPS
 	depends on OLG_SD_ENABLE
 
 config OLG_STATUS_LED
-	bool "Enable visible status LED diagnostics"
+	bool "Enable solid status LED on startup fault"
 	default n
-
-config OLG_ACC_DIAG_LED
-	bool "Pulse status LED after ADXL345 FIFO drains"
-	default n
-	depends on OLG_ACC_ENABLE && OLG_STATUS_LED
-
-config OLG_ACC_DIAG_LED_MS
-	int "ADXL345 FIFO diagnostic LED pulse width in milliseconds"
-	default 20
-	range 1 1000
-	depends on OLG_ACC_DIAG_LED
-
-config OLG_ACC_DIAG_POLL_MS
-	int "ADXL345 FIFO diagnostic polling interval in milliseconds"
-	default 0
-	range 0 60000
-	depends on OLG_ACC_ENABLE
-	help
-	  When non-zero, periodically submit a FIFO drain even if the ADXL345
-	  interrupt pin does not fire. This is only for bring-up diagnostics.
 
 config OLG_MAIN_IDLE_MAX_MS
 	int "Maximum main-loop sleep interval"

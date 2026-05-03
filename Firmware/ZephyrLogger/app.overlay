@@ -83,7 +83,7 @@
 	};
 };
 
-/* Keep the power-test app quiet and avoid board extras where possible. */
+/* Keep the production logger quiet and avoid unused board peripherals. */
 &adc {
 	status = "disabled";
 };

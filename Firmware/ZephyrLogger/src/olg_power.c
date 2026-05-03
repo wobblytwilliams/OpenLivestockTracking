@@ -25,7 +25,6 @@
 static const struct device *const gpio0 = DEVICE_DT_GET(GPIO0_NODE);
 static const struct device *const gpio1 = DEVICE_DT_GET(GPIO1_NODE);
 static const struct gpio_dt_spec status_led = GPIO_DT_SPEC_GET(STATUS_LED_NODE, gpios);
-static struct k_work_delayable status_led_off_work;
 
 static int configure_output(const struct device *port, gpio_pin_t pin, int value)
 {
@@ -113,38 +112,14 @@ static void qspi_flash_deep_power_down(void)
 	(void)configure_output(gpio0, PIN_QSPI_CS, 1);
 }
 
-static void status_led_off(struct k_work *work)
-{
-	ARG_UNUSED(work);
-
-	olg_power_status_ok();
-}
-
-static void status_led_startup_blink(void)
-{
-	if (!IS_ENABLED(CONFIG_OLG_STATUS_LED) || !gpio_is_ready_dt(&status_led)) {
-		return;
-	}
-
-	for (uint8_t i = 0; i < 3; i++) {
-		(void)gpio_pin_set_dt(&status_led, 1);
-		k_msleep(100);
-		(void)gpio_pin_set_dt(&status_led, 0);
-		k_msleep(100);
-	}
-}
-
 int olg_power_init(void)
 {
 	if (!device_is_ready(gpio0) || !device_is_ready(gpio1)) {
 		return -ENODEV;
 	}
 
-	k_work_init_delayable(&status_led_off_work, status_led_off);
-
 	if (IS_ENABLED(CONFIG_OLG_STATUS_LED)) {
 		(void)gpio_pin_configure_dt(&status_led, GPIO_OUTPUT_INACTIVE);
-		status_led_startup_blink();
 	}
 
 	dotstar_off();
@@ -160,20 +135,6 @@ void olg_power_idle(uint32_t ms)
 	}
 
 	k_sleep(K_MSEC(ms));
-}
-
-void olg_power_pulse_status_led(uint32_t ms)
-{
-	if (!IS_ENABLED(CONFIG_OLG_STATUS_LED) || !gpio_is_ready_dt(&status_led)) {
-		return;
-	}
-
-	if (ms < 1U) {
-		ms = 1U;
-	}
-
-	(void)gpio_pin_set_dt(&status_led, 1);
-	(void)k_work_reschedule(&status_led_off_work, K_MSEC(ms));
 }
 
 void olg_power_status_ok(void)

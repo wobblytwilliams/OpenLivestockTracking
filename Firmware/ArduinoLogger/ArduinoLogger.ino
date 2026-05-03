@@ -1,5 +1,5 @@
 /*
-  Logger (ACC + GPS + BLE) with:
+  ArduinoLogger production firmware (ACC + GPS + BLE) with:
   - ACC via ADXL345 FIFO watermark interrupt (DATA READY style) to wake MCU
   - GPS NON-BLOCKING state machine (bounded per-loop time)
   - GPS software standby when not busy (UBX-RXM-PMREQ backup + force, UART RX wake)
@@ -28,27 +28,6 @@
 
 #if defined(SOFTDEVICE_PRESENT)
   #include <nrf_soc.h>   // sd_app_evt_wait()
-  #include <nrf_sdm.h>   // sd_softdevice_disable()
-#endif
-
-#define POWER_TEST_NORMAL            0
-#define POWER_TEST_MCU_IDLE_ONLY     1
-#define POWER_TEST_GPS_STANDBY_ONLY  2
-#define POWER_TEST_LOGGER_NO_GPS     3
-#define POWER_TEST_LOGGER_GPS_ASLEEP 4
-#define POWER_TEST_GPS_ASLEEP_NO_SD  5
-#define POWER_TEST_GPS_ASLEEP_NO_BLE 6
-#define POWER_TEST_GPS_ASLEEP_NO_ACC 7
-#define POWER_TEST_GPS_CYCLE_NO_SD_NO_ACC 8
-#define POWER_TEST_GPS_STANDBY_RELEASE_UART 9
-#define POWER_TEST_GPS_GATE_ACC_BLE_SD_3MIN 10
-
-#ifndef POWER_TEST_MODE
-  #define POWER_TEST_MODE POWER_TEST_NORMAL
-#endif
-
-#ifndef BLE_DISABLE_STACK_BETWEEN_WINDOWS
-  #define BLE_DISABLE_STACK_BETWEEN_WINDOWS 0
 #endif
 
 // ===============================
@@ -104,8 +83,6 @@ struct Config {
   int8_t   ble_tx_power_dbm     = 0;
   bool     ble_central_only     = true;  // scanner-only; no advertising/peripheral role
   bool     ble_conn_led_enabled = false; // LED blink costs power during scan windows
-  bool     ble_disable_stack_between_windows = BLE_DISABLE_STACK_BETWEEN_WINDOWS;
-
   // BLE scan duty within the scan window
   float    ble_scan_duty        = 0.10f;  // 0.05 to 1.0 is a sensible test range
   uint32_t ble_scan_interval_ms = 100;
@@ -530,7 +507,6 @@ static void adxl_int1_isr() {
 // ===============================
 static bool ble_scanning = false;
 static bool ble_stack_started = false;
-static bool softdevice_active = false;
 static volatile bool ble_resume_allowed = false;
 static volatile uint32_t ble_resume_suppressed = 0;
 static volatile uint32_t ble_resume_fail = 0;
@@ -663,35 +639,12 @@ static bool ble_begin_stack() {
   }
   if (!ok) return false;
 
-  softdevice_active = true;
   ble_stack_started = true;
   Bluefruit.autoConnLed(CFG.ble_conn_led_enabled && !sd_startup_failed);
   Bluefruit.setTxPower(CFG.ble_tx_power_dbm);
   Bluefruit.setName("Logger");
   status_led_set(sd_startup_failed);
   return true;
-}
-
-static void ble_shutdown_stack() {
-  if (!ble_stack_started) return;
-
-  ble_resume_allowed = false;
-  if (ble_scanning) {
-    Bluefruit.Scanner.stop();
-    ble_scanning = false;
-  }
-
-#if defined(SOFTDEVICE_PRESENT)
-  uint8_t sd_enabled = 0;
-  (void)sd_softdevice_is_enabled(&sd_enabled);
-  if (sd_enabled) {
-    (void)sd_softdevice_disable();
-  }
-  NVIC_DisableIRQ(SD_EVT_IRQn);
-#endif
-
-  ble_stack_started = false;
-  softdevice_active = false;
 }
 
 static void ble_start_scan() {
@@ -1482,57 +1435,6 @@ static bool first_data_flush_done = false;
 
 static void sleep_when_idle();
 
-static void apply_power_test_config() {
-#if POWER_TEST_MODE == POWER_TEST_LOGGER_NO_GPS || \
-    POWER_TEST_MODE == POWER_TEST_LOGGER_GPS_ASLEEP || \
-    POWER_TEST_MODE == POWER_TEST_GPS_ASLEEP_NO_SD || \
-    POWER_TEST_MODE == POWER_TEST_GPS_ASLEEP_NO_BLE || \
-    POWER_TEST_MODE == POWER_TEST_GPS_ASLEEP_NO_ACC
-  CFG.gps_enabled = false;
-#endif
-
-#if POWER_TEST_MODE == POWER_TEST_GPS_ASLEEP_NO_SD
-  CFG.sd_enabled = false;
-#endif
-
-#if POWER_TEST_MODE == POWER_TEST_GPS_CYCLE_NO_SD_NO_ACC
-  CFG.sd_enabled = false;
-  CFG.acc_enabled = false;
-  CFG.gps_interval_ms = 30000;
-#endif
-
-#if POWER_TEST_MODE == POWER_TEST_GPS_ASLEEP_NO_BLE
-  CFG.ble_enabled = false;
-  CFG.ble_log_enabled = false;
-#endif
-
-#if POWER_TEST_MODE == POWER_TEST_GPS_ASLEEP_NO_ACC
-  CFG.acc_enabled = false;
-#endif
-
-#if POWER_TEST_MODE == POWER_TEST_GPS_STANDBY_RELEASE_UART
-  CFG.gps_release_uart_pins_after_sleep = true;
-  CFG.gps_sleep_refresh_ms = 0;
-#endif
-
-#if POWER_TEST_MODE == POWER_TEST_GPS_GATE_ACC_BLE_SD_3MIN
-  CFG.gps_enabled = false;
-  CFG.gps_release_uart_pins_after_sleep = true;
-  CFG.gps_sleep_refresh_ms = 0;
-  CFG.flush_first_ms = 180000;
-#endif
-}
-
-static void power_test_idle_loop() {
-  sleep_when_idle();
-}
-
-static void power_test_gps_standby_setup() {
-  GPS_SERIAL.begin(CFG.gps_baud);
-  delay(250);
-  gps_enter_backup_sleep();
-}
-
 static void print_status() {
   if (!CFG.debug_enable) return;
 
@@ -1586,7 +1488,6 @@ static void print_status() {
 
 // CPU sleep primitive
 static void sleep_when_idle() {
-  (void)softdevice_active;
   waitForEvent();
 }
 
@@ -1596,34 +1497,12 @@ static void sleep_when_idle() {
 void setup() {
   status_led_init();
 
-#if POWER_TEST_MODE == POWER_TEST_GPS_GATE_ACC_BLE_SD_3MIN
-  CFG.gps_release_uart_pins_after_sleep = true;
-  CFG.gps_sleep_refresh_ms = 0;
-  power_test_gps_standby_setup();
-#endif
-
-#if POWER_TEST_MODE == POWER_TEST_LOGGER_GPS_ASLEEP || \
-    POWER_TEST_MODE == POWER_TEST_GPS_ASLEEP_NO_SD || \
-    POWER_TEST_MODE == POWER_TEST_GPS_ASLEEP_NO_BLE || \
-    POWER_TEST_MODE == POWER_TEST_GPS_ASLEEP_NO_ACC
-  power_test_gps_standby_setup();
-#endif
-
-  apply_power_test_config();
-
   if (CFG.debug_enable) {
     Serial.begin(115200);
     delay(100);
   }
 
   board_power_cleanup();
-
-#if POWER_TEST_MODE == POWER_TEST_MCU_IDLE_ONLY
-  return;
-#elif POWER_TEST_MODE == POWER_TEST_GPS_STANDBY_ONLY || POWER_TEST_MODE == POWER_TEST_GPS_STANDBY_RELEASE_UART
-  power_test_gps_standby_setup();
-  return;
-#endif
 
   // I2C
   Wire.begin();
@@ -1651,9 +1530,7 @@ void setup() {
 
   // BLE
   if (CFG.ble_enabled) {
-    if (!CFG.ble_disable_stack_between_windows) {
-      (void)ble_begin_stack();
-    }
+    (void)ble_begin_stack();
   }
 
   // GPS
@@ -1680,13 +1557,6 @@ void setup() {
 }
 
 void loop() {
-#if POWER_TEST_MODE == POWER_TEST_MCU_IDLE_ONLY || \
-    POWER_TEST_MODE == POWER_TEST_GPS_STANDBY_ONLY || \
-    POWER_TEST_MODE == POWER_TEST_GPS_STANDBY_RELEASE_UART
-  power_test_idle_loop();
-  return;
-#endif
-
   uint32_t now = millis();
 
   // 1) BLE scheduling FIRST
@@ -1701,7 +1571,6 @@ void loop() {
       t_last_ble_force_stop = now;
       ble_stop_scan();
     }
-    if (CFG.ble_disable_stack_between_windows) ble_shutdown_stack();
   }
   if (CFG.ble_enabled) ble_process_queue();
   if (sd_startup_failed) status_led_set(true);

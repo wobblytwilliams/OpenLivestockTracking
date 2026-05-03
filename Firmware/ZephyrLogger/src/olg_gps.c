@@ -11,6 +11,7 @@
 #include <zephyr/sys/atomic.h>
 #include <zephyr/sys/util.h>
 
+#include "olg_config.h"
 #include "olg_ring.h"
 #include "olg_time.h"
 
@@ -60,7 +61,9 @@ static bool time_reached(uint32_t now_ms, uint32_t target_ms)
 
 static uint32_t gps_interval_ms(void)
 {
-	return MAX(CONFIG_OLG_GPS_INTERVAL_MS, 1);
+	const struct olg_config *cfg = olg_config_get();
+
+	return MAX(cfg->gps_interval_ms, 1U);
 }
 
 static void gps_state_reset(void)
@@ -192,6 +195,7 @@ static void enter_backup_sleep(bool force_refresh)
 	resume_uart();
 	drain_uart(512);
 
+	/* Backup sleep is the SAM-M10Q low-current state between scheduled fix attempts. */
 	send_rxm_pmreq(0, BIT(1) | BIT(2), BIT(3));
 	k_msleep(20);
 	drain_uart(512);
@@ -226,7 +230,8 @@ static void start_attempt(uint32_t now_ms)
 
 	wake_for_attempt();
 	gps_busy_state = true;
-	attempt_deadline_ms = now_ms + MAX(CONFIG_OLG_GPS_TIMEOUT_MS, 1);
+	const struct olg_config *cfg = olg_config_get();
+	attempt_deadline_ms = now_ms + MAX(cfg->gps_timeout_ms, 1U);
 	gps_state_reset();
 	line_idx = 0;
 }
@@ -502,13 +507,26 @@ static void process_sentence(char *line, uint32_t sentence_ms)
 
 static bool fix_ready(void)
 {
+	const struct olg_config *cfg = olg_config_get();
+
 	return gps_st.rmc_valid && gps_st.have_latlon && gps_st.have_sats &&
-	       gps_st.sats >= CONFIG_OLG_GPS_MIN_SATS && gps_st.have_hdop &&
-	       gps_st.hdop_centi <= CONFIG_OLG_GPS_MIN_HDOP_CENTI;
+	       gps_st.sats >= cfg->gps_min_sats && gps_st.have_hdop &&
+	       gps_st.hdop_centi <= cfg->gps_min_hdop_centi;
 }
 
-static void finish_attempt(uint32_t now_ms)
+static void push_timeout_location(uint32_t now_ms)
 {
+	if (!olg_ring_push_gps(now_ms, 0.0f, 0.0f)) {
+		atomic_inc(&error_count);
+	}
+}
+
+static void finish_attempt(uint32_t now_ms, bool timed_out)
+{
+	if (timed_out) {
+		push_timeout_location(now_ms);
+	}
+
 	gps_busy_state = false;
 	line_idx = 0;
 	next_attempt_ms = now_ms + gps_interval_ms();
@@ -522,7 +540,7 @@ static void poll_bounded(uint32_t now_ms)
 	}
 
 	if (time_reached(now_ms, attempt_deadline_ms)) {
-		finish_attempt(now_ms);
+		finish_attempt(now_ms, true);
 		return;
 	}
 
@@ -551,7 +569,7 @@ static void poll_bounded(uint32_t now_ms)
 				if (fix_ready()) {
 					(void)olg_ring_push_gps(sentence_ms, gps_st.lat, gps_st.lon);
 					atomic_inc(&fix_count);
-					finish_attempt(sentence_ms);
+					finish_attempt(sentence_ms, false);
 					return;
 				}
 			}
@@ -591,9 +609,14 @@ int olg_gps_init(void)
 	gps_sleep_state = false;
 	line_idx = 0;
 
+	const struct olg_config *cfg = olg_config_get();
 	resume_uart();
 	k_msleep(CONFIG_OLG_GPS_WAKE_SETTLE_MS);
 	enter_backup_sleep(true);
+
+	if (!cfg->gps_enabled) {
+		return 0;
+	}
 
 	uint32_t now = k_uptime_get_32();
 	next_attempt_ms = now + gps_interval_ms();
@@ -607,6 +630,11 @@ int olg_gps_init(void)
 void olg_gps_service(uint32_t now_ms)
 {
 #if IS_ENABLED(CONFIG_OLG_GPS_ENABLE)
+	const struct olg_config *cfg = olg_config_get();
+	if (!cfg->gps_enabled) {
+		return;
+	}
+
 	if (gps_busy_state) {
 		poll_bounded(now_ms);
 		return;
@@ -634,6 +662,11 @@ void olg_gps_service(uint32_t now_ms)
 uint32_t olg_gps_ms_until_transition(uint32_t now_ms)
 {
 #if IS_ENABLED(CONFIG_OLG_GPS_ENABLE)
+	const struct olg_config *cfg = olg_config_get();
+	if (!cfg->gps_enabled) {
+		return UINT32_MAX;
+	}
+
 	if (gps_busy_state) {
 		return 1U;
 	}
@@ -658,6 +691,11 @@ uint32_t olg_gps_ms_until_transition(uint32_t now_ms)
 bool olg_gps_busy(void)
 {
 #if IS_ENABLED(CONFIG_OLG_GPS_ENABLE)
+	const struct olg_config *cfg = olg_config_get();
+	if (!cfg->gps_enabled) {
+		return false;
+	}
+
 	return gps_busy_state;
 #else
 	return false;
@@ -667,6 +705,11 @@ bool olg_gps_busy(void)
 bool olg_gps_sleeping(void)
 {
 #if IS_ENABLED(CONFIG_OLG_GPS_ENABLE)
+	const struct olg_config *cfg = olg_config_get();
+	if (!cfg->gps_enabled) {
+		return gps_sleep_state;
+	}
+
 	return gps_sleep_state;
 #else
 	return false;

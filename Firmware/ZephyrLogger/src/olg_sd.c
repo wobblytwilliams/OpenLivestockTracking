@@ -306,7 +306,7 @@ static void close_files(void)
 	files_open = false;
 }
 
-static void sd_sleep(void)
+static void sd_sleep_internal(void)
 {
 	close_files();
 
@@ -317,6 +317,7 @@ static void sd_sleep(void)
 
 	(void)disk_access_ioctl(SD_DISK_NAME, DISK_IOCTL_CTRL_DEINIT, NULL);
 	suspend_spi();
+	/* End every burst by pushing the card and SPI pins back to the measured low-current state. */
 	sd_send_cmd0_idle();
 	sd_release_bus_pins();
 }
@@ -333,21 +334,30 @@ static int open_one(struct fs_file_t *file, const char *path)
 	return fs_seek(file, 0, FS_SEEK_END);
 }
 
+static int mount_storage(void)
+{
+	resume_spi();
+
+	if (!mounted) {
+		int err = fs_mount(&mount);
+		if (err) {
+			return err;
+		}
+		mounted = true;
+	}
+
+	return 0;
+}
+
 static int open_files(void)
 {
 	if (files_open) {
 		return 0;
 	}
 
-	resume_spi();
-
-	int err = 0;
-	if (!mounted) {
-		err = fs_mount(&mount);
-		if (err) {
-			return err;
-		}
-		mounted = true;
+	int err = mount_storage();
+	if (err) {
+		return err;
 	}
 
 	err = open_one(&f_acc, SD_MOUNT_PT "/ACC.CSV");
@@ -373,7 +383,7 @@ static int open_files(void)
 
 fail:
 	close_files();
-	sd_sleep();
+	olg_sd_sleep();
 	return err;
 }
 
@@ -590,7 +600,7 @@ static void fail_write(void)
 	atomic_inc(&write_fail_count);
 	next_retry_ms = k_uptime_get_32() + CONFIG_OLG_SD_RETRY_BACKOFF_MS;
 	flush_requested = false;
-	sd_sleep();
+	olg_sd_sleep();
 }
 
 static bool flush_ring_burst(uint32_t *wrote_events_out)
@@ -645,7 +655,7 @@ static bool flush_ring_burst(uint32_t *wrote_events_out)
 
 	bool done = olg_ring_used() == 0U;
 	if (done || IS_ENABLED(CONFIG_OLG_SD_CLOSE_BETWEEN_FLUSHES)) {
-		sd_sleep();
+		olg_sd_sleep();
 	}
 
 	return done;
@@ -677,17 +687,64 @@ static uint32_t emerg_threshold(void)
 	return (olg_ring_capacity() * CONFIG_OLG_RING_EMERG_THRESHOLD_PERCENT) / 100U;
 }
 
-static int startup_check(void)
+#endif
+
+void olg_sd_mark_startup_failed(void)
 {
+	atomic_set(&startup_failed, 1);
+}
+
+int olg_sd_startup_mount(void)
+{
+#if IS_ENABLED(CONFIG_OLG_SD_ENABLE)
+	int err = mount_storage();
+
+	if (err) {
+		olg_sd_mark_startup_failed();
+	}
+
+	return err;
+#else
+	return 0;
+#endif
+}
+
+int olg_sd_startup_open_log_files(void)
+{
+#if IS_ENABLED(CONFIG_OLG_SD_ENABLE)
 	int err = open_files();
 
-	if (!err) {
-		err = ensure_headers();
+	if (err) {
+		olg_sd_mark_startup_failed();
 	}
-	sd_sleep();
+
 	return err;
-}
+#else
+	return 0;
 #endif
+}
+
+int olg_sd_startup_ensure_log_headers(void)
+{
+#if IS_ENABLED(CONFIG_OLG_SD_ENABLE)
+	int err = ensure_headers();
+
+	if (err) {
+		olg_sd_mark_startup_failed();
+	}
+
+	return err;
+#else
+	return 0;
+#endif
+}
+
+void olg_sd_sleep(void)
+{
+#if IS_ENABLED(CONFIG_OLG_SD_ENABLE)
+	sd_sleep_internal();
+#endif
+}
 
 int olg_sd_init(void)
 {
@@ -717,16 +774,6 @@ int olg_sd_init(void)
 	next_retry_ms = 0;
 	last_flush_done_ms = k_uptime_get_32();
 	first_data_flush_done = false;
-	sd_release_bus_pins();
-
-	if (IS_ENABLED(CONFIG_OLG_SD_STARTUP_CHECK)) {
-		int err = startup_check();
-
-		if (err) {
-			atomic_set(&startup_failed, 1);
-			return err;
-		}
-	}
 
 	return 0;
 #else

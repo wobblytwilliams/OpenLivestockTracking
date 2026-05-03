@@ -1,63 +1,78 @@
 # ZephyrLogger
 
-Side-by-side Zephyr migration for the OpenLivestockGPS logger. The first milestone is a low-power proof for:
-
-- ADXL345 over I2C at 12.5 Hz
-- FIFO watermark interrupt on ItsyBitsy D13 / P0.12
-- raw ACC samples into a RAM ring buffer
-- BLE observer scan windows, 10 s every 60 s
-- first BLE scan starts after the first 60 s, so the initial floor is ACC-only
-- GPS and SD available behind an explicit test config
+Production Zephyr firmware for the OpenLivestockGPS logger on the Adafruit
+ItsyBitsy nRF52840. This is the recommended firmware for low-power field tests.
+It compiles in ACC, BLE, GPS, and SD support; the SD card `CONFIG.TXT` decides
+which subsystems run at boot.
 
 ## Build
-
-Install upstream Zephyr, then from this directory:
 
 ```powershell
 west build -b adafruit_itsybitsy/nrf52840 .
 ```
 
-ACC-only comparison build:
+On Windows, build from a no-space app path if Zephyr has trouble with a cloud
+folder path such as `My Drive`.
 
-```powershell
-west build -b adafruit_itsybitsy/nrf52840 . -- -DEXTRA_CONF_FILE=acc_only.conf
+## Runtime Config
+
+At startup the firmware mounts the SD card, creates `CONFIG.TXT` if missing,
+loads it, creates CSV headers if needed, then closes/unmounts/deinitializes the
+card and releases the SPI pins. A solid red LED after startup means the SD or
+config startup path failed.
+
+Default `CONFIG.TXT`:
+
+```ini
+acc_enabled=true
+acc_odr_hz=12.5
+acc_range_g=16
+
+ble_enabled=true
+ble_period_ms=60000
+ble_window_ms=10000
+ble_scan_interval_ms=100
+ble_scan_window_ms=10
+
+gps_enabled=true
+gps_interval_ms=180000
+gps_timeout_ms=15000
+gps_min_sats=4
+gps_min_hdop=2.5
 ```
 
-BLE stack-off experiment:
+Edit `CONFIG.TXT` on the card and reboot to apply changes. Invalid or missing
+values fall back to compiled defaults. `acc_odr_hz` supports `12.5`, `25`, `50`,
+and `100`; `acc_range_g` supports `2`, `4`, `8`, and `16`.
 
-```powershell
-west build -b adafruit_itsybitsy/nrf52840 . -- -DEXTRA_CONF_FILE=ble_stack_off.conf
+Set `acc_enabled`, `ble_enabled`, or `gps_enabled` to `false` to skip that
+subsystem for a deployment.
+
+## Output Files
+
+```text
+ACC.CSV  ms,unix_ms,x_g,y_g,z_g
+GPS.CSV  ms,unix_ms,lat,lon
+BLE.CSV  ms,unix_ms,mac,rssi
 ```
 
-Temporary ACC FIFO visual check:
+`ms` is time since boot. `unix_ms` remains `0` until GPS provides a valid UTC
+sync. GPS attempts that time out write `0,0` so missed fixes are visible in the
+data.
 
-```powershell
-west build -b adafruit_itsybitsy/nrf52840 . -- -DEXTRA_CONF_FILE=acc_diag_led.conf
-```
+## Behavior Notes
 
-This blinks the red LED three times at startup, then pulses it after each FIFO
-drain. It also polls the FIFO every 2 s so it can distinguish "ACC is running
-but INT1 is not firing" from "ACC is not producing samples". Leave it off for
-final current readings.
+- `unix_ms` remains `0` until GPS provides a valid UTC sync.
+- GPS timeout rows write `0,0` so attempts are visible even without a fix.
+- ACC uses ADXL345 FIFO stream mode and INT1 level-active handling; production
+  builds do not poll as a fallback. The FIFO watermark is an internal firmware
+  setting, while `acc_range_g` controls the field measurement range.
+- SD writes are bursty: files are opened only for startup/header checks and ring
+  flushes, then the card is put back into the tested low-current state.
+- The first failsafe data flush is after 3 minutes; recurring failsafe flushes
+  are every 15 minutes.
 
-GPS + SD feature-parity test:
-
-```powershell
-west build -b adafruit_itsybitsy/nrf52840 . -- -DEXTRA_CONF_FILE=gps_sd.conf
-```
-
-This keeps ACC and BLE enabled, enables GPS UART on D0/D1, enables SD over SPI
-with CS on D10/P0.05, mounts the card at startup to create `ACC.CSV`,
-`GPS.CSV`, and `BLE.CSV`, then closes/unmounts/deinitializes/releases the SD bus
-between flush bursts. The first failsafe flush is set to 3 minutes for power
-testing. A solid red LED after startup means the SD startup check failed.
-
-The app disables USB serial/logging for power measurements and explicitly keeps
-DotStar SPI, ADC, USB, and onboard QSPI flash out of the test build.
-ADXL345 I2C transactions are grouped around FIFO drains and the I2C device is
-asked to suspend again between bursts.
-
-## Flash
+## Flash By UF2
 
 Double-tap reset to enter `ITSY840BOOT`, then copy:
 
@@ -66,15 +81,3 @@ build/zephyr/zephyr.uf2
 ```
 
 onto the bootloader drive.
-
-## Power Expectations
-
-- ACC-only should be near the Arduino ACC-only floor, about 2-3 mA on the current dev board.
-- ACC+BLE should show a scan-current bump for about 10 s per minute.
-- The key test is whether the non-scan phase returns near the ACC-only floor.
-
-## Feature-Parity Stubs
-
-GPS and SD are now real modules, but remain disabled in `prj.conf`. Use
-`gps_sd.conf` when the GPS and SD hardware are connected and you want to test the
-full logger path.
