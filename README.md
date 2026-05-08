@@ -8,13 +8,15 @@ CSV files on a microSD card so the data can be analysed after the deployment.
 
 Maintainer: Dr Thomas Williams
 
-The repository now keeps two production firmware code bases:
+The repository keeps two production firmware code bases:
 
 - `Firmware/ZephyrLogger`: the current low-power field-test firmware for the
   Adafruit ItsyBitsy nRF52840. This is the recommended path for new work.
 - `Firmware/ArduinoLogger`: the Arduino firmware. It keeps the same
   logging idea in the Arduino ecosystem and is useful as a fallback or for quick
   experiments, or if you're just more familiar in this environment.
+
+**Note, `ZephyrLogger` is entirely vibe coded, but is tested in production** I'm a parasitologist, not an engineer. I'd welcome contributions to improve/refine the existing codebase.
 
 ## What The Logger Records
 
@@ -56,21 +58,18 @@ field deployment.
 
 ## Install The ZephyrLogger UF2
 
-The easiest way to install the logger is to download the prebuilt UF2 file.
+The easiest way to install firmware on the the logger is to download the prebuilt UF2 file.
 You do not need Zephyr, Arduino, GitHub Actions, or any local build tools for
 this path.
 
-1. Download
-   [`zephyr.uf2`](https://github.com/wobblytwilliams/OpenAgLivestockTracking/releases/download/zephyrlogger-latest/zephyr.uf2).
+1. Download. The latest build files are also listed on the
+[ZephyrLogger Latest UF2 release page](https://github.com/wobblytwilliams/OpenAgLivestockTracking/releases/tag/zephyrlogger-latest).
+GitHub Actions updates that release after successful builds from `main`.
 2. Double-tap reset on the ItsyBitsy so the `ITSY840BOOT` drive appears.
 3. Copy `zephyr.uf2` onto `ITSY840BOOT`.
 
 After the copy finishes, the board reboots into the new firmware. On first boot,
 the firmware creates `CONFIG.TXT` and the CSV files on the microSD card.
-
-The latest build files are also listed on the
-[ZephyrLogger Latest UF2 release page](https://github.com/wobblytwilliams/OpenAgLivestockTracking/releases/tag/zephyrlogger-latest).
-GitHub Actions updates that release after successful builds from `main`.
 
 ## Build The Firmware Locally
 
@@ -78,26 +77,15 @@ Most users should install the prebuilt UF2 above. Build locally when you are
 editing firmware code, changing compiled defaults, or checking a branch before
 field testing.
 
-### ZephyrLogger
-
 Build the current production firmware from `Firmware/ZephyrLogger`:
 
 ```powershell
 west build -b adafruit_itsybitsy/nrf52840 .
 ```
 
-On Windows, Zephyr may behave badly when the app path contains spaces. If the
-build fails in a path such as `My Drive`, copy `Firmware/ZephyrLogger` to a short
-path such as `C:\Users\<you>\olg-zephyr-app` and build there.
-
-The local build creates:
-
 ```text
 build/zephyr/zephyr.uf2
 ```
-
-To flash it, double-tap reset on the ItsyBitsy so the `ITSY840BOOT` drive
-appears, then copy `build/zephyr/zephyr.uf2` onto that drive.
 
 ### ArduinoLogger
 
