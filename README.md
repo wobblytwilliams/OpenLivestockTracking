@@ -221,6 +221,24 @@ cd ~/OpenLivestockGateway/Gateway/RaspberryPi
 bash setup_pi.sh
 ```
 
+To let this computer SSH into the Pi without a password prompt, use SSH keys
+rather than removing the Pi password. Paste this on the Pi:
+
+```bash
+mkdir -p ~/.ssh
+chmod 700 ~/.ssh
+cat >> ~/.ssh/authorized_keys <<'EOF'
+paste-your-computer-public-key-here
+EOF
+chmod 600 ~/.ssh/authorized_keys
+```
+
+Then this computer can connect with:
+
+```powershell
+ssh thom@open-livestock-gateway.local
+```
+
 The Pi scans continuously. The logger only advertises briefly every 20 minutes,
 so the power cost mostly sits on the Pi. The gateway stores transfer state in
 SQLite and validated rows in Parquet.
@@ -260,10 +278,33 @@ cd ~/OpenLivestockGateway/Gateway/RaspberryPi
 bash run_dashboard.sh
 ```
 
+Once both manual commands work, install the boot services:
+
+```bash
+cd ~/OpenLivestockGateway/Gateway/RaspberryPi
+git pull --ff-only
+bash install_services.sh
+```
+
+After that, the gateway and dashboard start automatically at boot. Check them
+with:
+
+```bash
+systemctl status openlivestock-gateway --no-pager
+systemctl status openlivestock-dashboard --no-pager
+journalctl -u openlivestock-gateway -f
+```
+
 Then open the dashboard from a phone or computer on the same network:
 
 ```text
 http://raspberrypi.local:8080
+```
+
+If the Pi hostname is `open-livestock-gateway`, use:
+
+```text
+http://open-livestock-gateway.local:8080
 ```
 
 If that name does not resolve, use the Pi IP address:

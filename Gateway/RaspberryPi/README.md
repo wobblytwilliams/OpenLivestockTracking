@@ -16,6 +16,28 @@ cd ~/OpenLivestockGateway/Gateway/RaspberryPi
 bash setup_pi.sh
 ```
 
+## Passwordless SSH From Your Computer
+
+Use SSH keys rather than removing the Pi account password. Paste your computer's
+public key into the Pi's `authorized_keys` file:
+
+```bash
+mkdir -p ~/.ssh
+chmod 700 ~/.ssh
+cat >> ~/.ssh/authorized_keys <<'EOF'
+paste-your-computer-public-key-here
+EOF
+chmod 600 ~/.ssh/authorized_keys
+```
+
+Then connect from the computer with:
+
+```powershell
+ssh thom@open-livestock-gateway.local
+```
+
+Keep password login enabled until key login has been tested.
+
 If you have already cloned the repo, update it with:
 
 ```bash
@@ -26,6 +48,38 @@ git pull --ff-only
 cd ~/OpenLivestockGateway/Gateway/RaspberryPi
 bash setup_pi.sh
 ```
+
+## Install Boot Services
+
+Once manual gateway and dashboard runs work, install the boot services:
+
+```bash
+cd ~/OpenLivestockGateway/Gateway/RaspberryPi
+git pull --ff-only
+bash install_services.sh
+```
+
+Check them with:
+
+```bash
+systemctl status openlivestock-gateway --no-pager
+systemctl status openlivestock-dashboard --no-pager
+journalctl -u openlivestock-gateway -f
+```
+
+After a reboot, the gateway and dashboard should start automatically:
+
+```bash
+sudo reboot
+```
+
+Dashboard address on the normal Wi-Fi:
+
+```text
+http://open-livestock-gateway.local:8080
+```
+
+Hotspot/WAP setup is a later step after the normal Wi-Fi path is confirmed.
 
 ## Run The Gateway
 
