@@ -359,7 +359,17 @@ static void service_stream(void)
 {
 	uint8_t msg[8 + CONFIG_OLG_GATEWAY_CHUNK_BYTES];
 	size_t got = 0;
-	size_t max_payload = MIN(CONFIG_OLG_GATEWAY_CHUNK_BYTES, sizeof(msg) - 8U);
+	uint16_t mtu = current_conn ? bt_gatt_get_mtu(current_conn) : 0U;
+	size_t max_value = (mtu > 3U) ? (size_t)mtu - 3U : 0U;
+
+	if (max_value <= 8U) {
+		streaming = false;
+		notify_status(OLG_GW_STATUS_ERROR);
+		return;
+	}
+
+	size_t max_payload = MIN((size_t)CONFIG_OLG_GATEWAY_CHUNK_BYTES,
+				 MIN(sizeof(msg) - 8U, max_value - 8U));
 	int err = olg_sd_gateway_read_segment(stream_segment, stream_offset,
 					      &msg[8], max_payload, &got);
 
