@@ -142,6 +142,11 @@ def set_status(db: sqlite3.Connection, key: str, value: str) -> None:
     db.commit()
 
 
+def log(message: str) -> None:
+    stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+    print(f"{stamp} {message}", flush=True)
+
+
 def logger_id_from_info(raw: bytes) -> str:
     if len(raw) < 16 or raw[:4] != b"OLGI":
         return "unknown"
@@ -288,10 +293,12 @@ async def handle_device(device, data_dir: Path) -> None:
     parquet_root = data_dir / "parquet"
     queue: asyncio.Queue[bytes] = asyncio.Queue()
     set_status(db, "last_device_address", str(getattr(device, "address", "")))
+    log(f"Connecting to logger at {getattr(device, 'address', 'unknown address')}")
 
     async with BleakClient(device) as client:
         info = bytes(await client.read_gatt_char(INFO_UUID))
         logger_id = logger_id_from_info(info)
+        log(f"Connected to logger {logger_id}")
         now_ms = int(time.time() * 1000)
         db.execute(
             "insert into loggers(logger_id, last_seen_ms) values(?, ?) "
@@ -313,10 +320,16 @@ async def handle_device(device, data_dir: Path) -> None:
         if await wait_status(queue) != STATUS_OK:
             raise RuntimeError("logger prepare failed")
 
-        for segment in await read_manifest(client, queue):
+        manifest = await read_manifest(client, queue)
+        log(f"Logger {logger_id} has {len(manifest)} log segment(s)")
+
+        for segment in manifest:
             offset = segment_offset(db, logger_id, segment)
             if offset < segment.size:
+                log(f"Downloading segment {segment.index}: {offset}/{segment.size} bytes")
                 await stream_segment(client, queue, db, parquet_root, logger_id, segment, offset)
+            else:
+                log(f"Segment {segment.index} already downloaded ({segment.size} bytes)")
 
         await client.write_gatt_char(CONTROL_UUID, CMD_DONE, response=False)
         db.execute(
@@ -326,6 +339,7 @@ async def handle_device(device, data_dir: Path) -> None:
         db.commit()
         set_status(db, "last_transfer_ok_ms", str(int(time.time() * 1000)))
         set_status(db, "active_logger_id", "")
+        log(f"Transfer complete for logger {logger_id}")
 
 
 async def run(args: argparse.Namespace) -> None:
@@ -333,8 +347,10 @@ async def run(args: argparse.Namespace) -> None:
     db = open_db(data_dir / "gateway.sqlite")
     set_status(db, "process_started_ms", str(int(time.time() * 1000)))
     set_status(db, "last_error", "")
+    log(f"Gateway running. Data directory: {data_dir.resolve()}")
     while True:
         set_status(db, "last_scan_ms", str(int(time.time() * 1000)))
+        log(f"Scanning for OpenLivestock loggers for {args.scan_timeout:g} seconds...")
         try:
             device = await BleakScanner.find_device_by_filter(
                 lambda d, ad: SERVICE_UUID.lower() in [u.lower() for u in ad.service_uuids],
@@ -346,20 +362,22 @@ async def run(args: argparse.Namespace) -> None:
                 "`sudo systemctl restart bluetooth && bluetoothctl power on`, "
                 "or reboot the Pi after setup."
             )
-            print(message)
+            log(message)
             set_status(db, "last_scan_result", "bluetooth unavailable")
             set_status(db, "last_error", message)
             await asyncio.sleep(30)
             continue
         if device is None:
             set_status(db, "last_scan_result", "no logger found")
+            log("No logger found. Continuing to scan.")
             continue
         set_status(db, "last_scan_result", "logger found")
+        log(f"Logger advertisement found: {getattr(device, 'address', 'unknown address')}")
         try:
             await handle_device(device, data_dir)
         except Exception as exc:
             message = f"gateway transfer failed: {exc}"
-            print(message)
+            log(message)
             set_status(db, "last_error", message)
             await asyncio.sleep(5)
 

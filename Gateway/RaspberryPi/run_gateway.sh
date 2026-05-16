@@ -12,4 +12,5 @@ fi
 bash ensure_bluetooth.sh
 
 . .venv/bin/activate
-python olg_gateway.py --data-dir GatewayData "$@"
+echo "Bluetooth ready. Starting gateway scanner..."
+python -u olg_gateway.py --data-dir GatewayData "$@"

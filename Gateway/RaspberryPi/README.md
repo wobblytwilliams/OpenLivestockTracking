@@ -36,6 +36,16 @@ cd ~/OpenLivestockGateway/Gateway/RaspberryPi
 bash run_gateway.sh
 ```
 
+You should see repeated scanning messages. If no logger is in its gateway window
+yet, this is normal:
+
+```text
+Bluetooth ready. Starting gateway scanner...
+2026-05-17 10:00:00 Gateway running. Data directory: ...
+2026-05-17 10:00:00 Scanning for OpenLivestock loggers for 30 seconds...
+2026-05-17 10:00:30 No logger found. Continuing to scan.
+```
+
 If the runner says Bluetooth is not powered on, run:
 
 ```bash
