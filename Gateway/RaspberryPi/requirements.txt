@@ -1,0 +1,3 @@
+bleak>=0.22
+flask>=3
+pyarrow>=15

@@ -2,9 +2,9 @@
 
 [![Build ZephyrLogger UF2](https://github.com/wobblytwilliams/OpenAgLivestockTracking/actions/workflows/zephyrlogger-uf2.yml/badge.svg)](https://github.com/wobblytwilliams/OpenAgLivestockTracking/actions/workflows/zephyrlogger-uf2.yml)
 
-OpenLivestockGPS is store-on-board firmware for livestock loggers. The
-logger records movement, GPS position, and nearby Bluetooth devices to
-CSV files on a microSD card so the data can be analysed after the deployment.
+OpenLivestockGPS is store-on-board firmware for livestock loggers. The logger
+records movement, GPS position, and nearby Bluetooth devices to a microSD card,
+then turns those records into familiar CSV files for analysis.
 
 Maintainer: Dr Thomas Williams
 
@@ -28,7 +28,20 @@ The logger combines three signals that are useful in animal science field work:
 - Bluetooth scan records. These can be used as rough proximity information when
   tags, phones, gateways, or other BLE devices are nearby.
 
-Data is written to three files:
+ZephyrLogger stores field data as compact binary log segments:
+
+```text
+LOG/OLG00000.BIN
+LOG/OLG00001.BIN
+...
+```
+
+Binary storage is used because it is faster to write, smaller on the SD card,
+and safer after long deployments. Each block has a checksum, so if power is lost
+mid-write the converter can recover up to the last valid block.
+
+For analysis, the SD converter or Raspberry Pi gateway exports the same three
+CSV tables scientists expect:
 
 ```text
 ACC.CSV  ms,unix_ms,x_g,y_g,z_g
@@ -50,7 +63,7 @@ The current firmware targets:
 - Storage: microSD over SPI, with CS on D10 / P0.05
 
 Use a FAT-formatted microSD card. The Zephyr firmware treats the SD card as
-required because it stores both the configuration file and the CSV output. If SD
+required because it stores both `CONFIG.TXT` and the binary log segments. If SD
 startup fails, the status LED is held on solid so the fault is visible before a
 field deployment.
 
@@ -66,7 +79,7 @@ this path.
 3. Copy `zephyr.uf2` onto `ITSY840BOOT`.
 
 After the copy finishes, the board reboots into the new firmware. On first boot,
-the firmware creates `CONFIG.TXT` and the CSV files on the microSD card.
+the firmware creates `CONFIG.TXT` and the `LOG` folder on the microSD card.
 
 The latest build files are also listed on the
 [ZephyrLogger Latest UF2 release page](https://github.com/wobblytwilliams/OpenAgLivestockTracking/releases/tag/zephyrlogger-latest).
@@ -102,9 +115,9 @@ appears, then copy `build/zephyr/zephyr.uf2` onto that drive.
 ### ArduinoLogger
 
 `Firmware/ArduinoLogger/ArduinoLogger.ino` is configured in code through the
-`Config` struct near the top of the sketch. It records the same three CSV files
-as ZephyrLogger, but it does not read `CONFIG.TXT`; changing settings requires
-editing the sketch and reflashing.
+`Config` struct near the top of the sketch. It records directly to CSV and does
+not read `CONFIG.TXT`; changing settings requires editing the sketch and
+reflashing.
 
 The most useful ArduinoLogger fields are:
 
@@ -145,6 +158,14 @@ gps_interval_ms=180000
 gps_timeout_ms=15000
 gps_min_sats=4
 gps_min_hdop=2.5
+
+gateway_enabled=true
+gateway_period_ms=1200000
+gateway_adv_window_ms=30000
+gateway_session_timeout_ms=120000
+gateway_retry_count=2
+gateway_retry_min_ms=60000
+gateway_retry_max_ms=180000
 ```
 
 The main knobs are:
@@ -159,6 +180,10 @@ The main knobs are:
 - `gps_interval_ms` and `gps_timeout_ms`: how often GPS wakes and how long it
   tries for a usable fix.
 - `gps_min_sats` and `gps_min_hdop`: quality filters for accepting GPS fixes.
+- `gateway_period_ms`: how often the logger briefly advertises for a Raspberry
+  Pi gateway. The default is 20 minutes.
+- `gateway_adv_window_ms`: how long the logger is available for a gateway
+  connection during each period.
 
 Invalid or missing values fall back to compiled defaults, so a typo should not
 stop the logger from starting.
@@ -166,13 +191,91 @@ stop the logger from starting.
 Set `acc_enabled`, `ble_enabled`, or `gps_enabled` to `false` to skip that
 subsystem for a deployment.
 
+Set `gateway_enabled=false` if the deployment will use SD-card recovery only.
+
+## Getting CSV Data Back
+
+There are two supported paths back to CSV.
+
+For a recovered SD card, install the Raspberry Pi tools on a computer and run:
+
+```bash
+python Gateway/RaspberryPi/olg_log_convert.py sd-to-csv --input /path/to/SD --output exported_csv
+```
+
+This reads `LOG/OLG*.BIN` and creates:
+
+```text
+exported_csv/ACC.CSV
+exported_csv/GPS.CSV
+exported_csv/BLE.CSV
+```
+
+For near-real-time downloads, run a Raspberry Pi gateway. From an SSH session on
+the Pi, clone this branch into a fixed folder name:
+
+```bash
+cd ~
+git clone -b gateway-comms https://github.com/wobblytwilliams/OpenAgLivestockTracking.git OpenLivestockGateway
+cd ~/OpenLivestockGateway/Gateway/RaspberryPi
+bash setup_pi.sh
+```
+
+The Pi scans continuously. The logger only advertises briefly every 20 minutes,
+so the power cost mostly sits on the Pi. The gateway stores transfer state in
+SQLite and validated rows in Parquet.
+
+Start the downloader in one SSH tab:
+
+```bash
+cd ~/OpenLivestockGateway/Gateway/RaspberryPi
+bash run_gateway.sh
+```
+
+Start the dashboard in another SSH tab:
+
+```bash
+cd ~/OpenLivestockGateway/Gateway/RaspberryPi
+bash run_dashboard.sh
+```
+
+Then open the dashboard from a phone or computer on the same network:
+
+```text
+http://raspberrypi.local:8080
+```
+
+If that name does not resolve, use the Pi IP address:
+
+```text
+http://<pi-ip-address>:8080
+```
+
+Once the Pi hotspot is configured, the hotspot address will usually be:
+
+```text
+http://192.168.4.1:8080
+```
+
+The dashboard shows gateway heartbeat, recent transfer sessions, logger status,
+row counts, storage space, and a `Download CSV ZIP` button.
+
+To export the gateway store back to CSV from the command line:
+
+```bash
+cd ~/OpenLivestockGateway/Gateway/RaspberryPi
+. .venv/bin/activate
+python olg_log_convert.py parquet-to-csv --input GatewayData/parquet --output exported_csv
+```
+
 ## Choosing A Firmware
 
 Use `ZephyrLogger` for new development. It is the clean production path with
-runtime `CONFIG.TXT` settings and tested lower-current behaviour.
+runtime `CONFIG.TXT` settings, binary SD logging, gateway offload, and tested
+lower-current behaviour.
 
 Use `ArduinoLogger` if you want to tinker and you are confident with the Arduino
-toolchain. It writes the same CSV style but is configured in code rather than by
+toolchain. It writes CSV directly but is configured in code rather than by
 `CONFIG.TXT`. Power is significantly higher because of SD card latching and the
 difficulty of getting the Arduino stack into deep sleep.
 
@@ -191,5 +294,5 @@ Thomas Williams is acknowledged. See [LICENSE](LICENSE).
 5. Reboot the logger with the SD card installed.
 6. Confirm the status LED is not solid on.
 7. Deploy the logger.
-8. After recovery, copy `ACC.CSV`, `GPS.CSV`, and `BLE.CSV` from the SD card for
-   analysis.
+8. After recovery, convert the SD `LOG/OLG*.BIN` files to `ACC.CSV`, `GPS.CSV`,
+   and `BLE.CSV`, or export the Raspberry Pi gateway Parquet store to CSV.

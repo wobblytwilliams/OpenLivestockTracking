@@ -135,6 +135,29 @@ bool olg_ring_drop_event(uint8_t len)
 	return true;
 }
 
+uint32_t olg_ring_peek_raw(uint8_t *buf, uint32_t max_len)
+{
+	unsigned int key = irq_lock();
+	uint32_t got = ring_buf_peek(&olg_ring, buf, max_len);
+
+	irq_unlock(key);
+	return got;
+}
+
+bool olg_ring_drop_raw(uint32_t len)
+{
+	unsigned int key = irq_lock();
+
+	if (ring_buf_size_get(&olg_ring) < len) {
+		irq_unlock(key);
+		return false;
+	}
+
+	(void)ring_buf_get(&olg_ring, NULL, len);
+	irq_unlock(key);
+	return true;
+}
+
 uint32_t olg_ring_used(void)
 {
 	unsigned int key = irq_lock();

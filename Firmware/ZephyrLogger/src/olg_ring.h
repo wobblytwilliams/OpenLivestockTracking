@@ -13,6 +13,8 @@ bool olg_ring_push_gps(uint32_t ms, float lat, float lon);
 bool olg_ring_peek_event(uint8_t *type, uint8_t *len, uint8_t *payload,
 			 uint8_t payload_max);
 bool olg_ring_drop_event(uint8_t len);
+uint32_t olg_ring_peek_raw(uint8_t *buf, uint32_t max_len);
+bool olg_ring_drop_raw(uint32_t len);
 uint32_t olg_ring_used(void);
 uint32_t olg_ring_capacity(void);
 uint32_t olg_ring_drops(void);

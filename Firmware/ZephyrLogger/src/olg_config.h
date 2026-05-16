@@ -19,6 +19,14 @@ struct olg_config {
 	uint32_t gps_timeout_ms;
 	uint8_t gps_min_sats;
 	uint16_t gps_min_hdop_centi;
+
+	bool gateway_enabled;
+	uint32_t gateway_period_ms;
+	uint32_t gateway_adv_window_ms;
+	uint32_t gateway_session_timeout_ms;
+	uint8_t gateway_retry_count;
+	uint32_t gateway_retry_min_ms;
+	uint32_t gateway_retry_max_ms;
 };
 
 void olg_config_init_defaults(void);

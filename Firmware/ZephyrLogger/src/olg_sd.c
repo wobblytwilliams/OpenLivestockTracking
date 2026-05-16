@@ -12,6 +12,7 @@
 
 #include "olg_event.h"
 #include "olg_gps.h"
+#include "olg_log_format.h"
 #include "olg_ring.h"
 #include "olg_time.h"
 
@@ -28,13 +29,20 @@ static atomic_t startup_failed;
 #include <zephyr/pm/device.h>
 #include <zephyr/storage/disk_access.h>
 
-#define SD_DISK_NAME  "SD"
-#define SD_MOUNT_PT   "/" SD_DISK_NAME ":"
-#define SD_SLOT_NODE  DT_ALIAS(olg_sd_slot)
-#define SD_CS_NODE    DT_ALIAS(olg_sd_cs)
-#define SD_SCK_NODE   DT_ALIAS(olg_sd_sck)
-#define SD_MOSI_NODE  DT_ALIAS(olg_sd_mosi)
-#define SD_MISO_NODE  DT_ALIAS(olg_sd_miso)
+#define SD_DISK_NAME "SD"
+#define SD_MOUNT_PT  "/" SD_DISK_NAME ":"
+#define SD_LOG_DIR   SD_MOUNT_PT "/LOG"
+
+#define SD_SLOT_NODE DT_ALIAS(olg_sd_slot)
+#define SD_CS_NODE   DT_ALIAS(olg_sd_cs)
+#define SD_SCK_NODE  DT_ALIAS(olg_sd_sck)
+#define SD_MOSI_NODE DT_ALIAS(olg_sd_mosi)
+#define SD_MISO_NODE DT_ALIAS(olg_sd_miso)
+
+BUILD_ASSERT(sizeof(struct olg_log_block_header) == OLG_LOG_BLOCK_HEADER_LEN);
+BUILD_ASSERT(sizeof(struct olg_log_acc_record) == 2U + OLG_LOG_ACC_BODY_LEN);
+BUILD_ASSERT(sizeof(struct olg_log_gps_record) == 2U + OLG_LOG_GPS_BODY_LEN);
+BUILD_ASSERT(sizeof(struct olg_log_ble_record) == 2U + OLG_LOG_BLE_BODY_LEN);
 
 static FATFS fat_fs;
 static struct fs_mount_t mount = {
@@ -43,20 +51,21 @@ static struct fs_mount_t mount = {
 	.mnt_point = SD_MOUNT_PT,
 };
 
-static struct fs_file_t f_acc;
-static struct fs_file_t f_gps;
-static struct fs_file_t f_ble;
-
+static struct fs_file_t log_file;
 static bool mounted;
-static bool files_open;
-static bool acc_file_open;
-static bool gps_file_open;
-static bool ble_file_open;
+static bool log_file_open;
 static bool flush_requested;
+static bool gateway_session;
 static uint8_t flush_reason;
+static uint16_t active_segment;
+static uint32_t active_segment_size;
 static uint32_t next_retry_ms;
 static uint32_t last_flush_done_ms;
+static uint32_t block_sequence;
 static bool first_data_flush_done;
+
+static uint8_t raw_snapshot[CONFIG_OLG_SD_BINARY_PAYLOAD_BYTES];
+static uint8_t block_payload[CONFIG_OLG_SD_BINARY_PAYLOAD_BYTES];
 
 #if DT_NODE_HAS_STATUS(SD_SLOT_NODE, okay)
 static const struct device *const spi_dev = DEVICE_DT_GET(DT_BUS(SD_SLOT_NODE));
@@ -185,130 +194,54 @@ static void sd_send_cmd0_idle(void)
 	(void)sd_bitbang_transfer(0xff);
 }
 
-static int write_all(struct fs_file_t *file, const char *data, size_t len)
+static uint32_t crc32_ieee(const uint8_t *data, size_t len)
 {
-	ssize_t written = fs_write(file, data, len);
+	uint32_t crc = 0xffffffffU;
 
-	if (written < 0) {
-		return (int)written;
+	for (size_t i = 0; i < len; i++) {
+		crc ^= data[i];
+		for (uint8_t bit = 0; bit < 8; bit++) {
+			uint32_t mask = 0U - (crc & 1U);
+
+			crc = (crc >> 1) ^ (0xedb88320U & mask);
+		}
 	}
-	if ((size_t)written != len) {
-		return -EIO;
+
+	return crc ^ 0xffffffffU;
+}
+
+static int write_all(struct fs_file_t *file, const void *data, size_t len)
+{
+	const uint8_t *p = data;
+
+	while (len > 0U) {
+		ssize_t written = fs_write(file, p, len);
+
+		if (written < 0) {
+			return (int)written;
+		}
+		if (written == 0) {
+			return -EIO;
+		}
+
+		p += written;
+		len -= (size_t)written;
 	}
 
 	return 0;
 }
 
-static int write_cstr(struct fs_file_t *file, const char *text)
+static void close_log_file(void)
 {
-	return write_all(file, text, strlen(text));
-}
-
-static int write_u32(struct fs_file_t *file, uint32_t value)
-{
-	char buf[11];
-	int len = snprintf(buf, sizeof(buf), "%u", value);
-
-	if (len < 0 || len >= (int)sizeof(buf)) {
-		return -EINVAL;
+	if (log_file_open) {
+		(void)fs_close(&log_file);
+		log_file_open = false;
 	}
-
-	return write_all(file, buf, (size_t)len);
-}
-
-static int write_i32(struct fs_file_t *file, int32_t value)
-{
-	char buf[12];
-	int len = snprintf(buf, sizeof(buf), "%d", value);
-
-	if (len < 0 || len >= (int)sizeof(buf)) {
-		return -EINVAL;
-	}
-
-	return write_all(file, buf, (size_t)len);
-}
-
-static int write_u64(struct fs_file_t *file, uint64_t value)
-{
-	char buf[21];
-	char *p = buf + sizeof(buf);
-
-	*--p = '\0';
-	do {
-		*--p = (char)('0' + (value % 10U));
-		value /= 10U;
-	} while (value > 0U);
-
-	return write_cstr(file, p);
-}
-
-static int write_fixed6_scaled(struct fs_file_t *file, int64_t scaled)
-{
-	int err = 0;
-
-	if (scaled < 0) {
-		err = write_cstr(file, "-");
-		if (err) {
-			return err;
-		}
-		scaled = -scaled;
-	}
-
-	uint64_t whole = (uint64_t)scaled / 1000000ULL;
-	uint32_t frac = (uint32_t)((uint64_t)scaled % 1000000ULL);
-	char buf[28];
-	int len = snprintf(buf, sizeof(buf), "%llu.%06u",
-			   (unsigned long long)whole, frac);
-
-	if (len < 0 || len >= (int)sizeof(buf)) {
-		return -EINVAL;
-	}
-
-	return write_all(file, buf, (size_t)len);
-}
-
-static int write_float6(struct fs_file_t *file, float value)
-{
-	double scaled = (double)value * 1000000.0;
-	int64_t fixed = scaled >= 0.0 ? (int64_t)(scaled + 0.5) : (int64_t)(scaled - 0.5);
-
-	return write_fixed6_scaled(file, fixed);
-}
-
-static int write_mac(struct fs_file_t *file, const uint8_t mac[6])
-{
-	char buf[18];
-	int len = snprintf(buf, sizeof(buf), "%02X:%02X:%02X:%02X:%02X:%02X",
-			   mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-
-	if (len < 0 || len >= (int)sizeof(buf)) {
-		return -EINVAL;
-	}
-
-	return write_all(file, buf, (size_t)len);
-}
-
-static void close_files(void)
-{
-	if (acc_file_open) {
-		(void)fs_close(&f_acc);
-		acc_file_open = false;
-	}
-	if (gps_file_open) {
-		(void)fs_close(&f_gps);
-		gps_file_open = false;
-	}
-	if (ble_file_open) {
-		(void)fs_close(&f_ble);
-		ble_file_open = false;
-	}
-
-	files_open = false;
 }
 
 static void sd_sleep_internal(void)
 {
-	close_files();
+	close_log_file();
 
 	if (mounted) {
 		(void)fs_unmount(&mount);
@@ -317,21 +250,9 @@ static void sd_sleep_internal(void)
 
 	(void)disk_access_ioctl(SD_DISK_NAME, DISK_IOCTL_CTRL_DEINIT, NULL);
 	suspend_spi();
-	/* End every burst by pushing the card and SPI pins back to the measured low-current state. */
+	/* Keep the measured low-current SD state after every write or gateway session. */
 	sd_send_cmd0_idle();
 	sd_release_bus_pins();
-}
-
-static int open_one(struct fs_file_t *file, const char *path)
-{
-	fs_file_t_init(file);
-
-	int err = fs_open(file, path, FS_O_RDWR | FS_O_CREATE | FS_O_APPEND);
-	if (err) {
-		return err;
-	}
-
-	return fs_seek(file, 0, FS_SEEK_END);
 }
 
 static int mount_storage(void)
@@ -340,6 +261,7 @@ static int mount_storage(void)
 
 	if (!mounted) {
 		int err = fs_mount(&mount);
+
 		if (err) {
 			return err;
 		}
@@ -349,250 +271,223 @@ static int mount_storage(void)
 	return 0;
 }
 
-static int open_files(void)
+static void segment_path(uint16_t index, char *buf, size_t len)
 {
-	if (files_open) {
-		return 0;
+	(void)snprintf(buf, len, SD_LOG_DIR "/OLG%05u.BIN", index);
+}
+
+static int stat_segment(uint16_t index, struct fs_dirent *entry)
+{
+	char path[32];
+
+	segment_path(index, path, sizeof(path));
+	return fs_stat(path, entry);
+}
+
+static int find_active_segment(void)
+{
+	int err = fs_mkdir(SD_LOG_DIR);
+
+	if (err && err != -EEXIST) {
+		return err;
 	}
 
+	active_segment = 0;
+	active_segment_size = 0;
+
+	for (uint32_t i = 0; i <= UINT16_MAX; i++) {
+		struct fs_dirent entry;
+		int stat_err = stat_segment((uint16_t)i, &entry);
+
+		if (stat_err == -ENOENT) {
+			break;
+		}
+		if (stat_err) {
+			return stat_err;
+		}
+
+		active_segment = (uint16_t)i;
+		active_segment_size = (uint32_t)entry.size;
+	}
+
+	if (active_segment_size >= CONFIG_OLG_SD_SEGMENT_BYTES && active_segment < UINT16_MAX) {
+		active_segment++;
+		active_segment_size = 0;
+	}
+
+	return 0;
+}
+
+static int ensure_log_storage(void)
+{
 	int err = mount_storage();
+
 	if (err) {
 		return err;
 	}
 
-	err = open_one(&f_acc, SD_MOUNT_PT "/ACC.CSV");
+	err = find_active_segment();
 	if (err) {
-		goto fail;
+		return err;
 	}
-	acc_file_open = true;
 
-	err = open_one(&f_gps, SD_MOUNT_PT "/GPS.CSV");
-	if (err) {
-		goto fail;
-	}
-	gps_file_open = true;
-
-	err = open_one(&f_ble, SD_MOUNT_PT "/BLE.CSV");
-	if (err) {
-		goto fail;
-	}
-	ble_file_open = true;
-
-	files_open = true;
 	return 0;
-
-fail:
-	close_files();
-	olg_sd_sleep();
-	return err;
 }
 
-static int write_header_if_empty(struct fs_file_t *file, const char *header)
+static int open_active_for_append(void)
 {
-	off_t end = fs_tell(file);
+	if (log_file_open) {
+		return 0;
+	}
 
+	int err = ensure_log_storage();
+	if (err) {
+		return err;
+	}
+
+	char path[32];
+	segment_path(active_segment, path, sizeof(path));
+	fs_file_t_init(&log_file);
+
+	err = fs_open(&log_file, path, FS_O_RDWR | FS_O_CREATE | FS_O_APPEND);
+	if (err) {
+		return err;
+	}
+
+	log_file_open = true;
+	err = fs_seek(&log_file, 0, FS_SEEK_END);
+	if (err) {
+		close_log_file();
+		return err;
+	}
+
+	off_t end = fs_tell(&log_file);
 	if (end < 0) {
+		close_log_file();
 		return (int)end;
 	}
-	if (end > 0) {
+
+	active_segment_size = (uint32_t)end;
+	return 0;
+}
+
+static int rotate_if_needed(uint32_t block_size)
+{
+	if (active_segment_size == 0U ||
+	    active_segment_size + block_size <= CONFIG_OLG_SD_SEGMENT_BYTES ||
+	    active_segment == UINT16_MAX) {
 		return 0;
 	}
 
-	int err = write_cstr(file, header);
-	if (!err) {
-		err = write_cstr(file, "\n");
-	}
-	if (!err) {
-		err = fs_sync(file);
-	}
-
-	return err;
+	close_log_file();
+	active_segment++;
+	active_segment_size = 0;
+	return 0;
 }
 
-static int ensure_headers(void)
+static bool append_record(uint8_t type, uint8_t len, const uint8_t *payload,
+			  uint8_t *out, size_t out_max, size_t *out_len)
 {
-	int err = write_header_if_empty(&f_acc, "ms,unix_ms,x_g,y_g,z_g");
+	if (type == OLG_EVT_ACC && len == sizeof(struct olg_acc_payload)) {
+		struct olg_acc_payload acc;
+		struct olg_log_acc_record rec;
 
-	if (!err) {
-		err = write_header_if_empty(&f_gps, "ms,unix_ms,lat,lon");
-	}
-	if (!err) {
-		err = write_header_if_empty(&f_ble, "ms,unix_ms,mac,rssi");
+		if (*out_len + sizeof(rec) > out_max) {
+			return false;
+		}
+
+		memcpy(&acc, payload, sizeof(acc));
+		rec.type = OLG_LOG_REC_ACC;
+		rec.len = OLG_LOG_ACC_BODY_LEN;
+		rec.ms = acc.ms;
+		rec.unix_ms = olg_time_unix_ms_from_uptime(acc.ms);
+		rec.x = acc.x;
+		rec.y = acc.y;
+		rec.z = acc.z;
+		memcpy(out + *out_len, &rec, sizeof(rec));
+		*out_len += sizeof(rec);
+		return true;
 	}
 
-	return err;
+	if (type == OLG_EVT_GPS && len == sizeof(struct olg_gps_payload)) {
+		struct olg_gps_payload gps;
+		struct olg_log_gps_record rec;
+
+		if (*out_len + sizeof(rec) > out_max) {
+			return false;
+		}
+
+		memcpy(&gps, payload, sizeof(gps));
+		rec.type = OLG_LOG_REC_GPS;
+		rec.len = OLG_LOG_GPS_BODY_LEN;
+		rec.ms = gps.ms;
+		rec.unix_ms = olg_time_unix_ms_from_uptime(gps.ms);
+		rec.lat = gps.lat;
+		rec.lon = gps.lon;
+		memcpy(out + *out_len, &rec, sizeof(rec));
+		*out_len += sizeof(rec);
+		return true;
+	}
+
+	if (type == OLG_EVT_BLE && len == sizeof(struct olg_ble_payload)) {
+		struct olg_ble_payload ble;
+		struct olg_log_ble_record rec;
+
+		if (*out_len + sizeof(rec) > out_max) {
+			return false;
+		}
+
+		memcpy(&ble, payload, sizeof(ble));
+		rec.type = OLG_LOG_REC_BLE;
+		rec.len = OLG_LOG_BLE_BODY_LEN;
+		rec.ms = ble.ms;
+		rec.unix_ms = olg_time_unix_ms_from_uptime(ble.ms);
+		memcpy(rec.mac, ble.mac, sizeof(rec.mac));
+		rec.rssi = ble.rssi;
+		memcpy(out + *out_len, &rec, sizeof(rec));
+		*out_len += sizeof(rec);
+		return true;
+	}
+
+	atomic_inc(&bad_event_count);
+	return true;
 }
 
-static int commit_line(struct fs_file_t *file, off_t pos)
+static bool build_block_payload(uint32_t max_records, uint32_t *raw_consumed,
+				uint16_t *record_count, uint32_t *payload_len)
 {
-	int err = 0;
+	uint32_t raw_len = olg_ring_peek_raw(raw_snapshot, sizeof(raw_snapshot));
+	size_t out_len = 0;
+	uint32_t pos = 0;
 
-	if (IS_ENABLED(CONFIG_OLG_SD_SYNC_EACH_LINE)) {
-		err = fs_sync(file);
-	}
+	*raw_consumed = 0;
+	*record_count = 0;
+	*payload_len = 0;
 
-	if (err) {
-		(void)fs_truncate(file, pos);
-		(void)fs_seek(file, pos, FS_SEEK_SET);
-	}
+	while (pos + 2U <= raw_len && *record_count < max_records) {
+		uint8_t type = raw_snapshot[pos];
+		uint8_t len = raw_snapshot[pos + 1U];
+		uint32_t event_len = 2U + len;
+		size_t before = out_len;
 
-	return err;
-}
+		if (pos + event_len > raw_len) {
+			break;
+		}
 
-static int write_acc_event(const uint8_t *payload, uint8_t len)
-{
-	if (len != sizeof(struct olg_acc_payload)) {
-		return -EINVAL;
-	}
+		if (!append_record(type, len, raw_snapshot + pos + 2U,
+				   block_payload, sizeof(block_payload), &out_len)) {
+			break;
+		}
 
-	struct olg_acc_payload acc;
-	memcpy(&acc, payload, sizeof(acc));
-
-	off_t pos = fs_tell(&f_acc);
-	if (pos < 0) {
-		return (int)pos;
-	}
-
-	int err = write_u32(&f_acc, acc.ms);
-	if (!err) {
-		err = write_cstr(&f_acc, ",");
-	}
-	if (!err) {
-		err = write_u64(&f_acc, olg_time_unix_ms_from_uptime(acc.ms));
-	}
-	if (!err) {
-		err = write_cstr(&f_acc, ",");
-	}
-	if (!err) {
-		err = write_fixed6_scaled(&f_acc, (int64_t)acc.x * 3900LL);
-	}
-	if (!err) {
-		err = write_cstr(&f_acc, ",");
-	}
-	if (!err) {
-		err = write_fixed6_scaled(&f_acc, (int64_t)acc.y * 3900LL);
-	}
-	if (!err) {
-		err = write_cstr(&f_acc, ",");
-	}
-	if (!err) {
-		err = write_fixed6_scaled(&f_acc, (int64_t)acc.z * 3900LL);
-	}
-	if (!err) {
-		err = write_cstr(&f_acc, "\n");
-	}
-	if (!err) {
-		err = commit_line(&f_acc, pos);
+		pos += event_len;
+		*raw_consumed += event_len;
+		if (out_len > before) {
+			(*record_count)++;
+		}
 	}
 
-	return err;
-}
-
-static int write_gps_event(const uint8_t *payload, uint8_t len)
-{
-	if (len != sizeof(struct olg_gps_payload)) {
-		return -EINVAL;
-	}
-
-	struct olg_gps_payload gps;
-	memcpy(&gps, payload, sizeof(gps));
-
-	off_t pos = fs_tell(&f_gps);
-	if (pos < 0) {
-		return (int)pos;
-	}
-
-	int err = write_u32(&f_gps, gps.ms);
-	if (!err) {
-		err = write_cstr(&f_gps, ",");
-	}
-	if (!err) {
-		err = write_u64(&f_gps, olg_time_unix_ms_from_uptime(gps.ms));
-	}
-	if (!err) {
-		err = write_cstr(&f_gps, ",");
-	}
-	if (!err) {
-		err = write_float6(&f_gps, gps.lat);
-	}
-	if (!err) {
-		err = write_cstr(&f_gps, ",");
-	}
-	if (!err) {
-		err = write_float6(&f_gps, gps.lon);
-	}
-	if (!err) {
-		err = write_cstr(&f_gps, "\n");
-	}
-	if (!err) {
-		err = commit_line(&f_gps, pos);
-	}
-
-	return err;
-}
-
-static int write_ble_event(const uint8_t *payload, uint8_t len)
-{
-	if (len != sizeof(struct olg_ble_payload)) {
-		return -EINVAL;
-	}
-
-	struct olg_ble_payload ble;
-	memcpy(&ble, payload, sizeof(ble));
-
-	off_t pos = fs_tell(&f_ble);
-	if (pos < 0) {
-		return (int)pos;
-	}
-
-	int err = write_u32(&f_ble, ble.ms);
-	if (!err) {
-		err = write_cstr(&f_ble, ",");
-	}
-	if (!err) {
-		err = write_u64(&f_ble, olg_time_unix_ms_from_uptime(ble.ms));
-	}
-	if (!err) {
-		err = write_cstr(&f_ble, ",");
-	}
-	if (!err) {
-		err = write_mac(&f_ble, ble.mac);
-	}
-	if (!err) {
-		err = write_cstr(&f_ble, ",");
-	}
-	if (!err) {
-		err = write_i32(&f_ble, ble.rssi);
-	}
-	if (!err) {
-		err = write_cstr(&f_ble, "\n");
-	}
-	if (!err) {
-		err = commit_line(&f_ble, pos);
-	}
-
-	return err;
-}
-
-static int write_ring_event(uint8_t type, uint8_t len, const uint8_t *payload,
-			    bool *wrote_event)
-{
-	*wrote_event = false;
-
-	switch (type) {
-	case OLG_EVT_ACC:
-		*wrote_event = true;
-		return write_acc_event(payload, len);
-	case OLG_EVT_GPS:
-		*wrote_event = true;
-		return write_gps_event(payload, len);
-	case OLG_EVT_BLE:
-		*wrote_event = true;
-		return write_ble_event(payload, len);
-	default:
-		atomic_inc(&bad_event_count);
-		return 0;
-	}
+	*payload_len = (uint32_t)out_len;
+	return *raw_consumed > 0U;
 }
 
 static void fail_write(void)
@@ -600,62 +495,109 @@ static void fail_write(void)
 	atomic_inc(&write_fail_count);
 	next_retry_ms = k_uptime_get_32() + CONFIG_OLG_SD_RETRY_BACKOFF_MS;
 	flush_requested = false;
-	olg_sd_sleep();
+	if (!gateway_session) {
+		olg_sd_sleep();
+	}
+}
+
+static bool write_log_block(uint32_t max_records, uint32_t *wrote_records)
+{
+	uint32_t raw_consumed = 0;
+	uint32_t payload_len = 0;
+	uint16_t record_count = 0;
+
+	*wrote_records = 0;
+
+	if (olg_ring_used() == 0U) {
+		return true;
+	}
+
+	if (!build_block_payload(max_records, &raw_consumed, &record_count, &payload_len)) {
+		return true;
+	}
+
+	if (record_count == 0U) {
+		(void)olg_ring_drop_raw(raw_consumed);
+		return olg_ring_used() == 0U;
+	}
+
+	uint32_t block_size = sizeof(struct olg_log_block_header) + payload_len;
+	int err = rotate_if_needed(block_size);
+
+	if (!err) {
+		err = open_active_for_append();
+	}
+	if (err) {
+		fail_write();
+		return false;
+	}
+
+	struct olg_log_block_header header = {
+		.magic = OLG_LOG_BLOCK_MAGIC,
+		.version = OLG_LOG_BLOCK_VERSION,
+		.header_len = OLG_LOG_BLOCK_HEADER_LEN,
+		.sequence = block_sequence,
+		.payload_len = payload_len,
+		.record_count = record_count,
+		.reserved = 0,
+		.crc32 = crc32_ieee(block_payload, payload_len),
+	};
+
+	err = write_all(&log_file, &header, sizeof(header));
+	if (!err) {
+		err = write_all(&log_file, block_payload, payload_len);
+	}
+	if (!err && IS_ENABLED(CONFIG_OLG_SD_SYNC_EACH_LINE)) {
+		err = fs_sync(&log_file);
+	}
+	if (err) {
+		fail_write();
+		return false;
+	}
+
+	active_segment_size += block_size;
+	block_sequence++;
+	*wrote_records = record_count;
+	atomic_add(&written_count, record_count);
+
+	if (!olg_ring_drop_raw(raw_consumed)) {
+		atomic_inc(&bad_event_count);
+	}
+
+	return olg_ring_used() == 0U;
 }
 
 static bool flush_ring_burst(uint32_t *wrote_events_out)
 {
+	uint32_t wrote_total = 0;
+
 	*wrote_events_out = 0;
 
 	if (CONFIG_OLG_SD_RETRY_BACKOFF_MS > 0 &&
 	    !time_reached(k_uptime_get_32(), next_retry_ms)) {
 		return false;
 	}
-	if (olg_ring_used() == 0U) {
-		return true;
-	}
 
-	int err = open_files();
-	if (err) {
-		fail_write();
-		return false;
-	}
+	while (olg_ring_used() > 0U && wrote_total < CONFIG_OLG_SD_FLUSH_MAX_EVENTS_BURST) {
+		uint32_t wrote = 0;
+		bool done = write_log_block(CONFIG_OLG_SD_FLUSH_MAX_EVENTS_BURST - wrote_total,
+					    &wrote);
 
-	err = ensure_headers();
-	if (err) {
-		fail_write();
-		return false;
-	}
-
-	for (uint32_t i = 0; i < CONFIG_OLG_SD_FLUSH_MAX_EVENTS_BURST; i++) {
-		uint8_t type = 0;
-		uint8_t len = 0;
-		uint8_t payload[32];
-
-		if (!olg_ring_peek_event(&type, &len, payload, sizeof(payload))) {
+		wrote_total += wrote;
+		if (done || wrote == 0U) {
 			break;
 		}
-
-		bool wrote_event = false;
-		err = write_ring_event(type, len, payload, &wrote_event);
-		if (err) {
-			fail_write();
-			return false;
-		}
-
-		if (!olg_ring_drop_event(len)) {
-			atomic_inc(&bad_event_count);
-			break;
-		}
-		if (wrote_event) {
-			(*wrote_events_out)++;
-			atomic_inc(&written_count);
-		}
 	}
+
+	*wrote_events_out = wrote_total;
 
 	bool done = olg_ring_used() == 0U;
 	if (done || IS_ENABLED(CONFIG_OLG_SD_CLOSE_BETWEEN_FLUSHES)) {
-		olg_sd_sleep();
+		if (gateway_session) {
+			close_log_file();
+		} else {
+			olg_sd_sleep();
+		}
 	}
 
 	return done;
@@ -686,7 +628,6 @@ static uint32_t emerg_threshold(void)
 {
 	return (olg_ring_capacity() * CONFIG_OLG_RING_EMERG_THRESHOLD_PERCENT) / 100U;
 }
-
 #endif
 
 void olg_sd_mark_startup_failed(void)
@@ -712,7 +653,11 @@ int olg_sd_startup_mount(void)
 int olg_sd_startup_open_log_files(void)
 {
 #if IS_ENABLED(CONFIG_OLG_SD_ENABLE)
-	int err = open_files();
+	int err = ensure_log_storage();
+	if (!err) {
+		err = open_active_for_append();
+	}
+	close_log_file();
 
 	if (err) {
 		olg_sd_mark_startup_failed();
@@ -726,17 +671,7 @@ int olg_sd_startup_open_log_files(void)
 
 int olg_sd_startup_ensure_log_headers(void)
 {
-#if IS_ENABLED(CONFIG_OLG_SD_ENABLE)
-	int err = ensure_headers();
-
-	if (err) {
-		olg_sd_mark_startup_failed();
-	}
-
-	return err;
-#else
 	return 0;
-#endif
 }
 
 void olg_sd_sleep(void)
@@ -765,14 +700,15 @@ int olg_sd_init(void)
 #endif
 
 	mounted = false;
-	files_open = false;
-	acc_file_open = false;
-	gps_file_open = false;
-	ble_file_open = false;
+	log_file_open = false;
 	flush_requested = false;
+	gateway_session = false;
 	flush_reason = FLUSH_NORMAL;
+	active_segment = 0;
+	active_segment_size = 0;
 	next_retry_ms = 0;
 	last_flush_done_ms = k_uptime_get_32();
+	block_sequence = 0;
 	first_data_flush_done = false;
 
 	return 0;
@@ -784,6 +720,10 @@ int olg_sd_init(void)
 void olg_sd_service(uint32_t now_ms)
 {
 #if IS_ENABLED(CONFIG_OLG_SD_ENABLE)
+	if (gateway_session) {
+		return;
+	}
+
 	bool retry_waiting = CONFIG_OLG_SD_RETRY_BACKOFF_MS > 0 &&
 			     !time_reached(now_ms, next_retry_ms);
 
@@ -839,6 +779,9 @@ void olg_sd_service(uint32_t now_ms)
 uint32_t olg_sd_ms_until_transition(uint32_t now_ms)
 {
 #if IS_ENABLED(CONFIG_OLG_SD_ENABLE)
+	if (gateway_session) {
+		return UINT32_MAX;
+	}
 	if (flush_requested) {
 		return 1U;
 	}
@@ -851,6 +794,7 @@ uint32_t olg_sd_ms_until_transition(uint32_t now_ms)
 
 	if (!first_data_flush_done && CONFIG_OLG_SD_FLUSH_FIRST_MS > 0) {
 		uint32_t target = last_flush_done_ms + CONFIG_OLG_SD_FLUSH_FIRST_MS;
+
 		wait_ms = time_reached(now_ms, target) ? 1U : target - now_ms;
 	}
 
@@ -865,6 +809,200 @@ uint32_t olg_sd_ms_until_transition(uint32_t now_ms)
 #else
 	ARG_UNUSED(now_ms);
 	return UINT32_MAX;
+#endif
+}
+
+int olg_sd_gateway_begin(void)
+{
+#if IS_ENABLED(CONFIG_OLG_SD_ENABLE)
+	gateway_session = true;
+	int err = ensure_log_storage();
+
+	if (err) {
+		gateway_session = false;
+		fail_write();
+	}
+
+	return err;
+#else
+	return -ENOTSUP;
+#endif
+}
+
+int olg_sd_gateway_prepare(void)
+{
+#if IS_ENABLED(CONFIG_OLG_SD_ENABLE)
+	int err = olg_sd_gateway_begin();
+	if (err) {
+		return err;
+	}
+
+	while (olg_ring_used() > 0U) {
+		uint32_t wrote = 0;
+		bool done = write_log_block(CONFIG_OLG_SD_FLUSH_MAX_EVENTS_BURST, &wrote);
+
+		if (!done && wrote == 0U) {
+			return -EIO;
+		}
+	}
+
+	close_log_file();
+	last_flush_done_ms = k_uptime_get_32();
+	first_data_flush_done = true;
+	flush_requested = false;
+	return 0;
+#else
+	return -ENOTSUP;
+#endif
+}
+
+int olg_sd_gateway_manifest(struct olg_sd_segment_info *entries, uint8_t max_entries,
+			    uint8_t *count_out)
+{
+#if IS_ENABLED(CONFIG_OLG_SD_ENABLE)
+	if (entries == NULL || count_out == NULL) {
+		return -EINVAL;
+	}
+
+	int err = olg_sd_gateway_begin();
+	if (err) {
+		return err;
+	}
+
+	uint8_t count = 0;
+	for (uint32_t i = 0; i <= active_segment && count < max_entries; i++) {
+		struct fs_dirent entry;
+		int stat_err = stat_segment((uint16_t)i, &entry);
+
+		if (stat_err == -ENOENT) {
+			continue;
+		}
+		if (stat_err) {
+			return stat_err;
+		}
+
+		entries[count].index = (uint16_t)i;
+		entries[count].size = (uint32_t)entry.size;
+		entries[count].active = (i == active_segment) ? 1U : 0U;
+		count++;
+	}
+
+	*count_out = count;
+	return 0;
+#else
+	ARG_UNUSED(entries);
+	ARG_UNUSED(max_entries);
+	ARG_UNUSED(count_out);
+	return -ENOTSUP;
+#endif
+}
+
+int olg_sd_gateway_active_segment(uint16_t *index_out)
+{
+#if IS_ENABLED(CONFIG_OLG_SD_ENABLE)
+	if (index_out == NULL) {
+		return -EINVAL;
+	}
+
+	int err = olg_sd_gateway_begin();
+	if (err) {
+		return err;
+	}
+
+	*index_out = active_segment;
+	return 0;
+#else
+	ARG_UNUSED(index_out);
+	return -ENOTSUP;
+#endif
+}
+
+int olg_sd_gateway_segment_info(uint16_t index, struct olg_sd_segment_info *entry)
+{
+#if IS_ENABLED(CONFIG_OLG_SD_ENABLE)
+	if (entry == NULL) {
+		return -EINVAL;
+	}
+
+	int err = olg_sd_gateway_begin();
+	if (err) {
+		return err;
+	}
+
+	struct fs_dirent dirent;
+	err = stat_segment(index, &dirent);
+	if (err) {
+		return err;
+	}
+
+	entry->index = index;
+	entry->size = (uint32_t)dirent.size;
+	entry->active = (index == active_segment) ? 1U : 0U;
+	return 0;
+#else
+	ARG_UNUSED(index);
+	ARG_UNUSED(entry);
+	return -ENOTSUP;
+#endif
+}
+
+int olg_sd_gateway_read_segment(uint16_t index, uint32_t offset, uint8_t *buf,
+				size_t len, size_t *got_out)
+{
+#if IS_ENABLED(CONFIG_OLG_SD_ENABLE)
+	if (buf == NULL || got_out == NULL) {
+		return -EINVAL;
+	}
+
+	int err = olg_sd_gateway_begin();
+	if (err) {
+		return err;
+	}
+
+	char path[32];
+	struct fs_file_t file;
+
+	segment_path(index, path, sizeof(path));
+	fs_file_t_init(&file);
+
+	err = fs_open(&file, path, FS_O_READ);
+	if (err) {
+		return err;
+	}
+
+	err = fs_seek(&file, (off_t)offset, FS_SEEK_SET);
+	if (err) {
+		(void)fs_close(&file);
+		return err;
+	}
+
+	ssize_t got = fs_read(&file, buf, len);
+	int close_err = fs_close(&file);
+
+	if (got < 0) {
+		return (int)got;
+	}
+	if (close_err) {
+		return close_err;
+	}
+
+	*got_out = (size_t)got;
+	return 0;
+#else
+	ARG_UNUSED(index);
+	ARG_UNUSED(offset);
+	ARG_UNUSED(buf);
+	ARG_UNUSED(len);
+	ARG_UNUSED(got_out);
+	return -ENOTSUP;
+#endif
+}
+
+void olg_sd_gateway_end(void)
+{
+#if IS_ENABLED(CONFIG_OLG_SD_ENABLE)
+	gateway_session = false;
+	olg_sd_sleep();
 #endif
 }
 

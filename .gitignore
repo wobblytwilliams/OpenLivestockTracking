@@ -1,3 +1,6 @@
 .arduino-build/
 .vscode/
 Firmware/ZephyrLogger/build/
+__pycache__/
+*.pyc
+GatewayData/

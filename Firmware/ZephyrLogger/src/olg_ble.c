@@ -8,6 +8,7 @@
 #include <zephyr/sys/atomic.h>
 #include <zephyr/sys/util.h>
 
+#include "olg_bt.h"
 #include "olg_config.h"
 #include "olg_ring.h"
 
@@ -22,8 +23,8 @@ static atomic_t scan_stop_count;
 static atomic_t error_count;
 
 #if IS_ENABLED(CONFIG_BT) && IS_ENABLED(CONFIG_OLG_BLE_ENABLE)
-static bool bt_enabled;
 static bool scanning;
+static bool paused;
 static uint32_t next_scan_start_ms;
 static uint32_t scan_stop_ms;
 
@@ -76,22 +77,6 @@ static void scan_cb(const bt_addr_le_t *addr, int8_t rssi, uint8_t adv_type,
 	atomic_inc(&seen_count);
 }
 
-static int enable_bt_if_needed(void)
-{
-	if (bt_enabled) {
-		return 0;
-	}
-
-	int err = bt_enable(NULL);
-	if (err) {
-		atomic_inc(&error_count);
-		return err;
-	}
-
-	bt_enabled = true;
-	return 0;
-}
-
 static void schedule_next_period(uint32_t now_ms)
 {
 	const struct olg_config *cfg = olg_config_get();
@@ -115,7 +100,8 @@ static void start_scan(uint32_t now_ms)
 		interval_ms = 1U;
 	}
 
-	if (enable_bt_if_needed()) {
+	if (olg_bt_enable()) {
+		atomic_inc(&error_count);
 		next_scan_start_ms = now_ms + cfg->ble_period_ms;
 		return;
 	}
@@ -175,8 +161,14 @@ int olg_ble_init(void)
 
 	next_scan_start_ms = k_uptime_get_32() + cfg->ble_period_ms;
 	scan_stop_ms = next_scan_start_ms + cfg->ble_window_ms;
+	paused = false;
 
-	return enable_bt_if_needed();
+	int err = olg_bt_enable();
+	if (err) {
+		atomic_inc(&error_count);
+	}
+
+	return err;
 #else
 	return 0;
 #endif
@@ -187,6 +179,13 @@ void olg_ble_service(uint32_t now_ms)
 #if IS_ENABLED(CONFIG_BT) && IS_ENABLED(CONFIG_OLG_BLE_ENABLE)
 	const struct olg_config *cfg = olg_config_get();
 	if (!cfg->ble_enabled) {
+		return;
+	}
+
+	if (paused) {
+		if (scanning) {
+			stop_scan(now_ms);
+		}
 		return;
 	}
 
@@ -205,11 +204,23 @@ void olg_ble_service(uint32_t now_ms)
 #endif
 }
 
+void olg_ble_pause(bool pause)
+{
+#if IS_ENABLED(CONFIG_BT) && IS_ENABLED(CONFIG_OLG_BLE_ENABLE)
+	paused = pause;
+	if (pause && scanning) {
+		stop_scan(k_uptime_get_32());
+	}
+#else
+	ARG_UNUSED(pause);
+#endif
+}
+
 uint32_t olg_ble_ms_until_transition(uint32_t now_ms)
 {
 #if IS_ENABLED(CONFIG_BT) && IS_ENABLED(CONFIG_OLG_BLE_ENABLE)
 	const struct olg_config *cfg = olg_config_get();
-	if (!cfg->ble_enabled) {
+	if (!cfg->ble_enabled || paused) {
 		return UINT32_MAX;
 	}
 

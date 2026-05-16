@@ -44,6 +44,24 @@
 #ifndef CONFIG_OLG_GPS_MIN_HDOP_CENTI
 #define CONFIG_OLG_GPS_MIN_HDOP_CENTI 250
 #endif
+#ifndef CONFIG_OLG_GATEWAY_PERIOD_MS
+#define CONFIG_OLG_GATEWAY_PERIOD_MS 1200000
+#endif
+#ifndef CONFIG_OLG_GATEWAY_ADV_WINDOW_MS
+#define CONFIG_OLG_GATEWAY_ADV_WINDOW_MS 30000
+#endif
+#ifndef CONFIG_OLG_GATEWAY_SESSION_TIMEOUT_MS
+#define CONFIG_OLG_GATEWAY_SESSION_TIMEOUT_MS 120000
+#endif
+#ifndef CONFIG_OLG_GATEWAY_RETRY_COUNT
+#define CONFIG_OLG_GATEWAY_RETRY_COUNT 2
+#endif
+#ifndef CONFIG_OLG_GATEWAY_RETRY_MIN_MS
+#define CONFIG_OLG_GATEWAY_RETRY_MIN_MS 60000
+#endif
+#ifndef CONFIG_OLG_GATEWAY_RETRY_MAX_MS
+#define CONFIG_OLG_GATEWAY_RETRY_MAX_MS 180000
+#endif
 
 static struct olg_config cfg;
 
@@ -109,6 +127,13 @@ static void finalize_config(void)
 	cfg.gps_interval_ms = MAX(cfg.gps_interval_ms, 1U);
 	cfg.gps_timeout_ms = MAX(cfg.gps_timeout_ms, 1U);
 	cfg.gps_min_sats = (uint8_t)clamp_u32(cfg.gps_min_sats, 0U, 32U);
+
+	cfg.gateway_enabled = cfg.gateway_enabled && IS_ENABLED(CONFIG_OLG_GATEWAY_ENABLE);
+	cfg.gateway_period_ms = MAX(cfg.gateway_period_ms, 1U);
+	cfg.gateway_adv_window_ms = MAX(cfg.gateway_adv_window_ms, 1U);
+	cfg.gateway_session_timeout_ms = MAX(cfg.gateway_session_timeout_ms, 1U);
+	cfg.gateway_retry_min_ms = MAX(cfg.gateway_retry_min_ms, 1U);
+	cfg.gateway_retry_max_ms = MAX(cfg.gateway_retry_max_ms, cfg.gateway_retry_min_ms);
 }
 
 void olg_config_init_defaults(void)
@@ -128,6 +153,15 @@ void olg_config_init_defaults(void)
 	cfg.gps_timeout_ms = MAX(CONFIG_OLG_GPS_TIMEOUT_MS, 1);
 	cfg.gps_min_sats = (uint8_t)clamp_u32(CONFIG_OLG_GPS_MIN_SATS, 0U, 32U);
 	cfg.gps_min_hdop_centi = CONFIG_OLG_GPS_MIN_HDOP_CENTI;
+
+	cfg.gateway_enabled = IS_ENABLED(CONFIG_OLG_GATEWAY_ENABLE);
+	cfg.gateway_period_ms = MAX(CONFIG_OLG_GATEWAY_PERIOD_MS, 1);
+	cfg.gateway_adv_window_ms = MAX(CONFIG_OLG_GATEWAY_ADV_WINDOW_MS, 1);
+	cfg.gateway_session_timeout_ms = MAX(CONFIG_OLG_GATEWAY_SESSION_TIMEOUT_MS, 1);
+	cfg.gateway_retry_count = (uint8_t)MIN(CONFIG_OLG_GATEWAY_RETRY_COUNT, 255);
+	cfg.gateway_retry_min_ms = MAX(CONFIG_OLG_GATEWAY_RETRY_MIN_MS, 1);
+	cfg.gateway_retry_max_ms = MAX(CONFIG_OLG_GATEWAY_RETRY_MAX_MS,
+					cfg.gateway_retry_min_ms);
 	finalize_config();
 }
 
@@ -296,6 +330,20 @@ static void apply_key_value(const char *key, const char *value)
 		cfg.gps_min_sats = (uint8_t)clamp_u32(u, 0U, 32U);
 	} else if (strcmp(key, "gps_min_hdop") == 0 && parse_decimal_scaled(value, 100U, &u)) {
 		cfg.gps_min_hdop_centi = (uint16_t)MIN(u, UINT16_MAX);
+	} else if (strcmp(key, "gateway_enabled") == 0 && parse_bool(value, &b)) {
+		cfg.gateway_enabled = b;
+	} else if (strcmp(key, "gateway_period_ms") == 0 && parse_u32(value, &u) && u > 0U) {
+		cfg.gateway_period_ms = u;
+	} else if (strcmp(key, "gateway_adv_window_ms") == 0 && parse_u32(value, &u) && u > 0U) {
+		cfg.gateway_adv_window_ms = u;
+	} else if (strcmp(key, "gateway_session_timeout_ms") == 0 && parse_u32(value, &u) && u > 0U) {
+		cfg.gateway_session_timeout_ms = u;
+	} else if (strcmp(key, "gateway_retry_count") == 0 && parse_u32(value, &u)) {
+		cfg.gateway_retry_count = (uint8_t)MIN(u, 255U);
+	} else if (strcmp(key, "gateway_retry_min_ms") == 0 && parse_u32(value, &u) && u > 0U) {
+		cfg.gateway_retry_min_ms = u;
+	} else if (strcmp(key, "gateway_retry_max_ms") == 0 && parse_u32(value, &u) && u > 0U) {
+		cfg.gateway_retry_max_ms = u;
 	}
 }
 
@@ -331,7 +379,7 @@ static void parse_config_text(char *text)
 
 static int write_config_defaults(struct fs_file_t *file)
 {
-	char buf[384];
+	char buf[640];
 	char hdop[16];
 	uint16_t hdop_whole = cfg.gps_min_hdop_centi / 100U;
 	uint16_t hdop_frac = cfg.gps_min_hdop_centi % 100U;
@@ -357,7 +405,14 @@ static int write_config_defaults(struct fs_file_t *file)
 			   "gps_interval_ms=%u\n"
 			   "gps_timeout_ms=%u\n"
 			   "gps_min_sats=%u\n"
-			   "gps_min_hdop=%s\n",
+			   "gps_min_hdop=%s\n\n"
+			   "gateway_enabled=%s\n"
+			   "gateway_period_ms=%u\n"
+			   "gateway_adv_window_ms=%u\n"
+			   "gateway_session_timeout_ms=%u\n"
+			   "gateway_retry_count=%u\n"
+			   "gateway_retry_min_ms=%u\n"
+			   "gateway_retry_max_ms=%u\n",
 			   cfg.acc_enabled ? "true" : "false",
 			   cfg.acc_odr_millihz == 12500U ? "12.5" :
 			   cfg.acc_odr_millihz == 25000U ? "25" :
@@ -372,7 +427,14 @@ static int write_config_defaults(struct fs_file_t *file)
 			   cfg.gps_interval_ms,
 			   cfg.gps_timeout_ms,
 			   cfg.gps_min_sats,
-			   hdop);
+			   hdop,
+			   cfg.gateway_enabled ? "true" : "false",
+			   cfg.gateway_period_ms,
+			   cfg.gateway_adv_window_ms,
+			   cfg.gateway_session_timeout_ms,
+			   cfg.gateway_retry_count,
+			   cfg.gateway_retry_min_ms,
+			   cfg.gateway_retry_max_ms);
 
 	if (len < 0 || len >= (int)sizeof(buf)) {
 		return -EINVAL;

@@ -128,7 +128,7 @@ config OLG_GPS_POLL_BYTE_BUDGET
 	depends on OLG_GPS_ENABLE
 
 config OLG_SD_ENABLE
-	bool "Enable SD/FatFs CSV flush"
+	bool "Enable SD/FatFs binary log flush"
 	default n
 	depends on SPI && DISK_ACCESS && FILE_SYSTEM && FAT_FILESYSTEM_ELM
 
@@ -148,8 +148,19 @@ config OLG_SD_RELEASE_SPI_PINS_ON_SLEEP
 	depends on OLG_SD_ENABLE
 
 config OLG_SD_SYNC_EACH_LINE
-	bool "Sync each CSV line instead of syncing on close"
+	bool "Sync each binary block instead of syncing on close"
 	default n
+	depends on OLG_SD_ENABLE
+
+config OLG_SD_BINARY_PAYLOAD_BYTES
+	int "Maximum binary log payload per block"
+	default 4096
+	range 256 16384
+	depends on OLG_SD_ENABLE
+
+config OLG_SD_SEGMENT_BYTES
+	int "Binary log segment rotation size"
+	default 8388608
 	depends on OLG_SD_ENABLE
 
 config OLG_SD_FLUSH_FIRST_MS
@@ -181,6 +192,48 @@ config OLG_SD_BLOCK_FLUSH_DURING_GPS
 config OLG_STATUS_LED
 	bool "Enable solid status LED on startup fault"
 	default n
+
+config OLG_GATEWAY_ENABLE
+	bool "Enable GATT gateway offload"
+	default y
+	depends on BT && BT_PERIPHERAL && BT_BROADCASTER
+
+config OLG_GATEWAY_PERIOD_MS
+	int "Gateway advertising period in milliseconds"
+	default 1200000
+	depends on OLG_GATEWAY_ENABLE
+
+config OLG_GATEWAY_ADV_WINDOW_MS
+	int "Gateway advertising window in milliseconds"
+	default 30000
+	depends on OLG_GATEWAY_ENABLE
+
+config OLG_GATEWAY_SESSION_TIMEOUT_MS
+	int "Gateway connection timeout in milliseconds"
+	default 120000
+	depends on OLG_GATEWAY_ENABLE
+
+config OLG_GATEWAY_RETRY_COUNT
+	int "Gateway short retry windows after failed transfer"
+	default 2
+	range 0 255
+	depends on OLG_GATEWAY_ENABLE
+
+config OLG_GATEWAY_RETRY_MIN_MS
+	int "Minimum failed-transfer retry delay"
+	default 60000
+	depends on OLG_GATEWAY_ENABLE
+
+config OLG_GATEWAY_RETRY_MAX_MS
+	int "Maximum failed-transfer retry delay"
+	default 180000
+	depends on OLG_GATEWAY_ENABLE
+
+config OLG_GATEWAY_CHUNK_BYTES
+	int "Maximum GATT data payload per notify chunk"
+	default 180
+	range 32 240
+	depends on OLG_GATEWAY_ENABLE
 
 config OLG_MAIN_IDLE_MAX_MS
 	int "Maximum main-loop sleep interval"
