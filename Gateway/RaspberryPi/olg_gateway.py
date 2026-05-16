@@ -34,6 +34,9 @@ STATUS_OK = 0
 STATUS_EOF = 1
 STATUS_ERROR = 2
 
+CONTROL_TIMEOUT_S = 20.0
+STREAM_IDLE_TIMEOUT_S = 20.0
+
 
 @dataclass
 class Segment:
@@ -227,9 +230,16 @@ def commit_block(
     db.commit()
 
 
+async def next_gateway_msg(queue: asyncio.Queue[bytes], timeout: float, context: str) -> bytes:
+    try:
+        return await asyncio.wait_for(queue.get(), timeout=timeout)
+    except asyncio.TimeoutError as exc:
+        raise TimeoutError(f"timed out waiting for {context}") from exc
+
+
 async def wait_status(queue: asyncio.Queue[bytes]) -> int:
     while True:
-        msg = await queue.get()
+        msg = await next_gateway_msg(queue, CONTROL_TIMEOUT_S, "gateway status")
         if msg and msg[0] == MSG_STATUS:
             return msg[1]
 
@@ -239,7 +249,7 @@ async def read_manifest(client: BleakClient, queue: asyncio.Queue[bytes]) -> lis
     await client.write_gatt_char(CONTROL_UUID, CMD_MANIFEST, response=False)
 
     while True:
-        msg = await queue.get()
+        msg = await next_gateway_msg(queue, CONTROL_TIMEOUT_S, "manifest data")
         if not msg:
             continue
         if msg[0] == MSG_STATUS:
@@ -267,7 +277,7 @@ async def stream_segment(
     await client.write_gatt_char(CONTROL_UUID, cmd, response=False)
 
     while True:
-        msg = await queue.get()
+        msg = await next_gateway_msg(queue, STREAM_IDLE_TIMEOUT_S, "stream data")
         if not msg:
             continue
         if msg[0] == MSG_STATUS:
@@ -286,6 +296,7 @@ async def stream_segment(
 
         for block_offset, block_end, rows in assembler.feed(chunk_offset, payload):
             commit_block(db, parquet_root, logger_id, segment.index, block_offset, block_end, rows)
+            log(f"Committed segment {segment.index}: {block_end}/{segment.size} bytes")
 
 
 async def handle_device(device, data_dir: Path) -> None:
@@ -294,6 +305,8 @@ async def handle_device(device, data_dir: Path) -> None:
     queue: asyncio.Queue[bytes] = asyncio.Queue()
     set_status(db, "last_device_address", str(getattr(device, "address", "")))
     log(f"Connecting to logger at {getattr(device, 'address', 'unknown address')}")
+    session: int | None = None
+    logger_id = "unknown"
 
     async with BleakClient(device) as client:
         info = bytes(await client.read_gatt_char(INFO_UUID))
@@ -315,31 +328,41 @@ async def handle_device(device, data_dir: Path) -> None:
         def on_data(_sender, data: bytearray) -> None:
             queue.put_nowait(bytes(data))
 
-        await client.start_notify(DATA_UUID, on_data)
-        await client.write_gatt_char(CONTROL_UUID, CMD_PREPARE, response=False)
-        if await wait_status(queue) != STATUS_OK:
-            raise RuntimeError("logger prepare failed")
+        try:
+            await client.start_notify(DATA_UUID, on_data)
+            await client.write_gatt_char(CONTROL_UUID, CMD_PREPARE, response=False)
+            if await wait_status(queue) != STATUS_OK:
+                raise RuntimeError("logger prepare failed")
 
-        manifest = await read_manifest(client, queue)
-        log(f"Logger {logger_id} has {len(manifest)} log segment(s)")
+            manifest = await read_manifest(client, queue)
+            log(f"Logger {logger_id} has {len(manifest)} log segment(s)")
 
-        for segment in manifest:
-            offset = segment_offset(db, logger_id, segment)
-            if offset < segment.size:
-                log(f"Downloading segment {segment.index}: {offset}/{segment.size} bytes")
-                await stream_segment(client, queue, db, parquet_root, logger_id, segment, offset)
-            else:
-                log(f"Segment {segment.index} already downloaded ({segment.size} bytes)")
+            for segment in manifest:
+                offset = segment_offset(db, logger_id, segment)
+                if offset < segment.size:
+                    log(f"Downloading segment {segment.index}: {offset}/{segment.size} bytes")
+                    await stream_segment(client, queue, db, parquet_root, logger_id, segment, offset)
+                else:
+                    log(f"Segment {segment.index} already downloaded ({segment.size} bytes)")
 
-        await client.write_gatt_char(CONTROL_UUID, CMD_DONE, response=False)
-        db.execute(
-            "update sessions set finished_ms=?, status=? where id=?",
-            (int(time.time() * 1000), "ok", session),
-        )
-        db.commit()
-        set_status(db, "last_transfer_ok_ms", str(int(time.time() * 1000)))
-        set_status(db, "active_logger_id", "")
-        log(f"Transfer complete for logger {logger_id}")
+            await client.write_gatt_char(CONTROL_UUID, CMD_DONE, response=False)
+            db.execute(
+                "update sessions set finished_ms=?, status=? where id=?",
+                (int(time.time() * 1000), "ok", session),
+            )
+            db.commit()
+            set_status(db, "last_transfer_ok_ms", str(int(time.time() * 1000)))
+            log(f"Transfer complete for logger {logger_id}")
+        except Exception:
+            if session is not None:
+                db.execute(
+                    "update sessions set finished_ms=?, status=? where id=?",
+                    (int(time.time() * 1000), "failed", session),
+                )
+                db.commit()
+            raise
+        finally:
+            set_status(db, "active_logger_id", "")
 
 
 async def run(args: argparse.Namespace) -> None:
