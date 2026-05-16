@@ -1,6 +1,6 @@
 # OpenLivestockTracking
 
-[![Build ZephyrLogger UF2](https://github.com/wobblytwilliams/OpenAgLivestockTracking/actions/workflows/zephyrlogger-uf2.yml/badge.svg)](https://github.com/wobblytwilliams/OpenAgLivestockTracking/actions/workflows/zephyrlogger-uf2.yml)
+[![Build ZephyrLogger UF2](https://github.com/wobblytwilliams/OpenLivestockTracking/actions/workflows/zephyrlogger-uf2.yml/badge.svg)](https://github.com/wobblytwilliams/OpenLivestockTracking/actions/workflows/zephyrlogger-uf2.yml)
 
 OpenLivestockGPS is store-on-board firmware for livestock loggers. The logger
 records movement, GPS position, and nearby Bluetooth devices to a microSD card,
@@ -74,7 +74,7 @@ You do not need Zephyr, Arduino, GitHub Actions, or any local build tools for
 this path.
 
 1. Download
-   [`zephyr.uf2`](https://github.com/wobblytwilliams/OpenAgLivestockTracking/releases/download/zephyrlogger-latest/zephyr.uf2).
+   [`zephyr.uf2`](https://github.com/wobblytwilliams/OpenLivestockTracking/releases/download/zephyrlogger-latest/zephyr.uf2).
 2. Double-tap reset on the ItsyBitsy so the `ITSY840BOOT` drive appears.
 3. Copy `zephyr.uf2` onto `ITSY840BOOT`.
 
@@ -82,7 +82,7 @@ After the copy finishes, the board reboots into the new firmware. On first boot,
 the firmware creates `CONFIG.TXT` and the `LOG` folder on the microSD card.
 
 The latest build files are also listed on the
-[ZephyrLogger Latest UF2 release page](https://github.com/wobblytwilliams/OpenAgLivestockTracking/releases/tag/zephyrlogger-latest).
+[ZephyrLogger Latest UF2 release page](https://github.com/wobblytwilliams/OpenLivestockTracking/releases/tag/zephyrlogger-latest).
 GitHub Actions updates that release after successful builds from `main`.
 
 ## Build The Firmware Locally
@@ -216,7 +216,7 @@ the Pi, clone this branch into a fixed folder name:
 
 ```bash
 cd ~
-git clone -b gateway-comms https://github.com/wobblytwilliams/OpenAgLivestockTracking.git OpenLivestockGateway
+git clone -b gateway-comms https://github.com/wobblytwilliams/OpenLivestockTracking.git OpenLivestockGateway
 cd ~/OpenLivestockGateway/Gateway/RaspberryPi
 bash setup_pi.sh
 ```

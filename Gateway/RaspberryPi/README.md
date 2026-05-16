@@ -11,7 +11,7 @@ known folder name, so the later `cd` commands are always the same.
 
 ```bash
 cd ~
-git clone -b gateway-comms https://github.com/wobblytwilliams/OpenAgLivestockTracking.git OpenLivestockGateway
+git clone -b gateway-comms https://github.com/wobblytwilliams/OpenLivestockTracking.git OpenLivestockGateway
 cd ~/OpenLivestockGateway/Gateway/RaspberryPi
 bash setup_pi.sh
 ```
