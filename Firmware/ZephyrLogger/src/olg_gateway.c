@@ -489,7 +489,8 @@ uint32_t olg_gateway_ms_until_transition(uint32_t now_ms)
 	if (advertising) {
 		target = adv_stop_ms;
 	} else if (connected) {
-		target = session_deadline_ms;
+		/* A GATT write can arrive while the main loop is asleep; poll quickly during sessions. */
+		return 10U;
 	}
 
 	return time_reached(now_ms, target) ? 1U : target - now_ms;
