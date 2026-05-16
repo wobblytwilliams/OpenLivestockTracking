@@ -368,8 +368,15 @@ async def handle_device(device, data_dir: Path) -> None:
 async def run(args: argparse.Namespace) -> None:
     data_dir = Path(args.data_dir)
     db = open_db(data_dir / "gateway.sqlite")
-    set_status(db, "process_started_ms", str(int(time.time() * 1000)))
+    started_ms = int(time.time() * 1000)
+    db.execute(
+        "update sessions set finished_ms=?, status=? where finished_ms is null",
+        (started_ms, "interrupted"),
+    )
+    db.commit()
+    set_status(db, "process_started_ms", str(started_ms))
     set_status(db, "last_error", "")
+    set_status(db, "active_logger_id", "")
     log(f"Gateway running. Data directory: {data_dir.resolve()}")
     while True:
         set_status(db, "last_scan_ms", str(int(time.time() * 1000)))
