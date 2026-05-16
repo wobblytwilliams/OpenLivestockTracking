@@ -1,8 +1,10 @@
 # Raspberry Pi Gateway
 
 The gateway is the heavier side of the system. It scans for loggers, connects
-when a logger opens its 20-minute GATT window, downloads only new binary SD log
-blocks, and stores validated rows in SQLite + Parquet.
+when a logger opens its GATT window, downloads only new binary SD log blocks,
+and stores validated rows in SQLite + Parquet. The gateway-comms testing
+firmware advertises every 2 minutes by default; longer field deployments can
+set `gateway_period_ms=1200000` in `CONFIG.TXT` for a 20-minute interval.
 
 ## Fresh Pi Setup
 

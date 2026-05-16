@@ -402,7 +402,8 @@ int olg_gateway_init(void)
 	}
 
 	retry_left = cfg->gateway_retry_count;
-	next_adv_ms = k_uptime_get_32() + cfg->gateway_period_ms;
+	/* Open a short first window soon after boot so bench setup can confirm gateway comms. */
+	next_adv_ms = k_uptime_get_32() + MIN(cfg->gateway_period_ms, 10000U);
 	return 0;
 #else
 	return 0;

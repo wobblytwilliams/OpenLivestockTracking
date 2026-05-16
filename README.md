@@ -160,7 +160,7 @@ gps_min_sats=4
 gps_min_hdop=2.5
 
 gateway_enabled=true
-gateway_period_ms=1200000
+gateway_period_ms=120000
 gateway_adv_window_ms=30000
 gateway_session_timeout_ms=120000
 gateway_retry_count=2
@@ -181,7 +181,8 @@ The main knobs are:
   tries for a usable fix.
 - `gps_min_sats` and `gps_min_hdop`: quality filters for accepting GPS fixes.
 - `gateway_period_ms`: how often the logger briefly advertises for a Raspberry
-  Pi gateway. The default is 20 minutes.
+  Pi gateway. The gateway-comms testing default is 2 minutes. For longer field
+  deployments, use `1200000` for 20 minutes.
 - `gateway_adv_window_ms`: how long the logger is available for a gateway
   connection during each period.
 
@@ -239,9 +240,11 @@ Then this computer can connect with:
 ssh thom@open-livestock-gateway.local
 ```
 
-The Pi scans continuously. The logger only advertises briefly every 20 minutes,
-so the power cost mostly sits on the Pi. The gateway stores transfer state in
-SQLite and validated rows in Parquet.
+The Pi scans continuously. The logger only advertises briefly every 2 minutes in
+this gateway-comms test build, so the power cost mostly sits on the Pi. For
+longer field deployments, change `gateway_period_ms` back to `1200000` in
+`CONFIG.TXT`. The gateway stores transfer state in SQLite and validated rows in
+Parquet.
 
 Start the downloader in one SSH tab:
 

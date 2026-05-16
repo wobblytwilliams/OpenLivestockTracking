@@ -200,7 +200,7 @@ config OLG_GATEWAY_ENABLE
 
 config OLG_GATEWAY_PERIOD_MS
 	int "Gateway advertising period in milliseconds"
-	default 1200000
+	default 120000
 	depends on OLG_GATEWAY_ENABLE
 
 config OLG_GATEWAY_ADV_WINDOW_MS
