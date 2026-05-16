@@ -38,6 +38,10 @@ CONTROL_TIMEOUT_S = 20.0
 STREAM_IDLE_TIMEOUT_S = 20.0
 
 
+class PartialTransfer(Exception):
+    pass
+
+
 @dataclass
 class Segment:
     index: int
@@ -277,7 +281,15 @@ async def stream_segment(
     await client.write_gatt_char(CONTROL_UUID, cmd, response=False)
 
     while True:
-        msg = await next_gateway_msg(queue, STREAM_IDLE_TIMEOUT_S, "stream data")
+        try:
+            msg = await next_gateway_msg(queue, STREAM_IDLE_TIMEOUT_S, "stream data")
+        except TimeoutError as exc:
+            if assembler.base_offset > offset:
+                raise PartialTransfer(
+                    f"partial segment {segment.index} transfer stopped at "
+                    f"{assembler.base_offset}/{segment.size} bytes"
+                ) from exc
+            raise
         if not msg:
             continue
         if msg[0] == MSG_STATUS:
@@ -353,6 +365,15 @@ async def handle_device(device, data_dir: Path) -> None:
             db.commit()
             set_status(db, "last_transfer_ok_ms", str(int(time.time() * 1000)))
             log(f"Transfer complete for logger {logger_id}")
+        except PartialTransfer as exc:
+            log(str(exc))
+            if session is not None:
+                db.execute(
+                    "update sessions set finished_ms=?, status=? where id=?",
+                    (int(time.time() * 1000), "partial", session),
+                )
+                db.commit()
+            set_status(db, "last_error", "")
         except Exception:
             if session is not None:
                 db.execute(
@@ -402,6 +423,7 @@ async def run(args: argparse.Namespace) -> None:
             log("No logger found. Continuing to scan.")
             continue
         set_status(db, "last_scan_result", "logger found")
+        set_status(db, "last_error", "")
         log(f"Logger advertisement found: {getattr(device, 'address', 'unknown address')}")
         try:
             await handle_device(device, data_dir)
