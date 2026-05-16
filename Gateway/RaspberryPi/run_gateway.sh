@@ -9,5 +9,7 @@ if [ ! -f .venv/bin/activate ]; then
   exit 1
 fi
 
+bash ensure_bluetooth.sh
+
 . .venv/bin/activate
 python olg_gateway.py --data-dir GatewayData "$@"

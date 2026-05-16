@@ -232,6 +232,17 @@ cd ~/OpenLivestockGateway/Gateway/RaspberryPi
 bash run_gateway.sh
 ```
 
+If it reports that Bluetooth is not powered on, run:
+
+```bash
+sudo systemctl restart bluetooth
+bluetoothctl power on
+bash run_gateway.sh
+```
+
+After the first setup, a reboot can also be needed so the Pi applies the
+Bluetooth group membership.
+
 Start the dashboard in another SSH tab:
 
 ```bash

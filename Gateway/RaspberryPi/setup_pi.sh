@@ -6,11 +6,13 @@ cd "$SCRIPT_DIR"
 
 echo "Installing Raspberry Pi packages..."
 sudo apt update
-sudo apt install -y git python3-venv python3-pip bluetooth bluez
+sudo apt install -y git python3-venv python3-pip bluetooth bluez rfkill
 
 if getent group bluetooth >/dev/null 2>&1; then
   sudo usermod -aG bluetooth "$USER" || true
 fi
+
+bash ensure_bluetooth.sh || true
 
 echo "Creating Python virtual environment..."
 python3 -m venv .venv

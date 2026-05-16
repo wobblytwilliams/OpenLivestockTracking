@@ -12,6 +12,7 @@ from uuid import uuid4
 import pyarrow as pa
 import pyarrow.parquet as pq
 from bleak import BleakClient, BleakScanner
+from bleak.exc import BleakBluetoothNotAvailableError
 
 from olg_log_format import BLOCK_HEADER, iter_blocks
 
@@ -334,10 +335,22 @@ async def run(args: argparse.Namespace) -> None:
     set_status(db, "last_error", "")
     while True:
         set_status(db, "last_scan_ms", str(int(time.time() * 1000)))
-        device = await BleakScanner.find_device_by_filter(
-            lambda d, ad: SERVICE_UUID.lower() in [u.lower() for u in ad.service_uuids],
-            timeout=args.scan_timeout,
-        )
+        try:
+            device = await BleakScanner.find_device_by_filter(
+                lambda d, ad: SERVICE_UUID.lower() in [u.lower() for u in ad.service_uuids],
+                timeout=args.scan_timeout,
+            )
+        except BleakBluetoothNotAvailableError:
+            message = (
+                "Bluetooth adapter is not powered. Run "
+                "`sudo systemctl restart bluetooth && bluetoothctl power on`, "
+                "or reboot the Pi after setup."
+            )
+            print(message)
+            set_status(db, "last_scan_result", "bluetooth unavailable")
+            set_status(db, "last_error", message)
+            await asyncio.sleep(30)
+            continue
         if device is None:
             set_status(db, "last_scan_result", "no logger found")
             continue
