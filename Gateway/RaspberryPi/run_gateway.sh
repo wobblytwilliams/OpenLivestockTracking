@@ -9,7 +9,9 @@ if [ ! -f .venv/bin/activate ]; then
   exit 1
 fi
 
-bash ensure_bluetooth.sh
+if [ "${OLG_SKIP_BLUETOOTH_PREFLIGHT:-0}" != "1" ]; then
+  bash ensure_bluetooth.sh
+fi
 
 . .venv/bin/activate
 echo "Bluetooth ready. Starting gateway scanner..."

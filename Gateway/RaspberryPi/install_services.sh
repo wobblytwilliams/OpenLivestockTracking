@@ -31,10 +31,12 @@ Wants=bluetooth.service network-online.target
 Type=simple
 User=$SERVICE_USER
 WorkingDirectory=$SCRIPT_DIR
+ExecStartPre=+/bin/bash $SCRIPT_DIR/ensure_bluetooth.sh
 ExecStart=/bin/bash $SCRIPT_DIR/run_gateway.sh
 Restart=always
 RestartSec=10
 Environment=PYTHONUNBUFFERED=1
+Environment=OLG_SKIP_BLUETOOTH_PREFLIGHT=1
 
 [Install]
 WantedBy=multi-user.target
