@@ -200,17 +200,71 @@ config OLG_GATEWAY_ENABLE
 
 config OLG_GATEWAY_PERIOD_MS
 	int "Gateway advertising period in milliseconds"
-	default 120000
+	default 60000
+	depends on OLG_GATEWAY_ENABLE
+	help
+	  Backward-compatible alias for the eligible advertising period. New
+	  runtime CONFIG.TXT files should prefer gateway_eligible_adv_period_ms.
+
+config OLG_GATEWAY_UPLOAD_ACC
+	bool "Allow gateway offload of raw accelerometer records"
+	default n
+	depends on OLG_GATEWAY_ENABLE
+	help
+	  The SD card always keeps the full binary archive. Keep this disabled for
+	  lightweight gateway mode so the radio only carries GPS/BLE records.
+
+config OLG_GATEWAY_UPLOAD_GPS
+	bool "Allow gateway offload of GPS records"
+	default y
+	depends on OLG_GATEWAY_ENABLE
+
+config OLG_GATEWAY_UPLOAD_BLE
+	bool "Allow gateway offload of BLE records"
+	default y
 	depends on OLG_GATEWAY_ENABLE
 
 config OLG_GATEWAY_ADV_WINDOW_MS
 	int "Gateway advertising window in milliseconds"
-	default 30000
+	default 5000
+	depends on OLG_GATEWAY_ENABLE
+	help
+	  Backward-compatible alias for the eligible advertising window. New
+	  runtime CONFIG.TXT files should prefer gateway_eligible_adv_window_ms.
+
+config OLG_GATEWAY_DOWNLOAD_COOLDOWN_MS
+	int "Cooldown after a successful gateway download"
+	default 21600000
+	depends on OLG_GATEWAY_ENABLE
+
+config OLG_GATEWAY_ELIGIBLE_ADV_PERIOD_MS
+	int "Eligible gateway advertising period"
+	default 60000
+	depends on OLG_GATEWAY_ENABLE
+
+config OLG_GATEWAY_ELIGIBLE_ADV_WINDOW_MS
+	int "Eligible gateway advertising burst length"
+	default 5000
+	depends on OLG_GATEWAY_ENABLE
+
+config OLG_GATEWAY_COOLDOWN_ADV_ENABLE
+	bool "Advertise presence while inside gateway cooldown"
+	default y
+	depends on OLG_GATEWAY_ENABLE
+
+config OLG_GATEWAY_COOLDOWN_ADV_PERIOD_MS
+	int "Cooldown gateway advertising period"
+	default 600000
+	depends on OLG_GATEWAY_ENABLE
+
+config OLG_GATEWAY_COOLDOWN_ADV_WINDOW_MS
+	int "Cooldown gateway advertising burst length"
+	default 3000
 	depends on OLG_GATEWAY_ENABLE
 
 config OLG_GATEWAY_SESSION_TIMEOUT_MS
 	int "Gateway connection timeout in milliseconds"
-	default 120000
+	default 180000
 	depends on OLG_GATEWAY_ENABLE
 
 config OLG_GATEWAY_RETRY_COUNT

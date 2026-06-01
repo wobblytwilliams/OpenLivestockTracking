@@ -45,13 +45,40 @@
 #define CONFIG_OLG_GPS_MIN_HDOP_CENTI 250
 #endif
 #ifndef CONFIG_OLG_GATEWAY_PERIOD_MS
-#define CONFIG_OLG_GATEWAY_PERIOD_MS 120000
+#define CONFIG_OLG_GATEWAY_PERIOD_MS 60000
+#endif
+#ifndef CONFIG_OLG_GATEWAY_UPLOAD_ACC
+#define CONFIG_OLG_GATEWAY_UPLOAD_ACC 0
+#endif
+#ifndef CONFIG_OLG_GATEWAY_UPLOAD_GPS
+#define CONFIG_OLG_GATEWAY_UPLOAD_GPS 1
+#endif
+#ifndef CONFIG_OLG_GATEWAY_UPLOAD_BLE
+#define CONFIG_OLG_GATEWAY_UPLOAD_BLE 1
 #endif
 #ifndef CONFIG_OLG_GATEWAY_ADV_WINDOW_MS
-#define CONFIG_OLG_GATEWAY_ADV_WINDOW_MS 30000
+#define CONFIG_OLG_GATEWAY_ADV_WINDOW_MS 5000
+#endif
+#ifndef CONFIG_OLG_GATEWAY_DOWNLOAD_COOLDOWN_MS
+#define CONFIG_OLG_GATEWAY_DOWNLOAD_COOLDOWN_MS 21600000
+#endif
+#ifndef CONFIG_OLG_GATEWAY_ELIGIBLE_ADV_PERIOD_MS
+#define CONFIG_OLG_GATEWAY_ELIGIBLE_ADV_PERIOD_MS 60000
+#endif
+#ifndef CONFIG_OLG_GATEWAY_ELIGIBLE_ADV_WINDOW_MS
+#define CONFIG_OLG_GATEWAY_ELIGIBLE_ADV_WINDOW_MS 5000
+#endif
+#ifndef CONFIG_OLG_GATEWAY_COOLDOWN_ADV_ENABLE
+#define CONFIG_OLG_GATEWAY_COOLDOWN_ADV_ENABLE 1
+#endif
+#ifndef CONFIG_OLG_GATEWAY_COOLDOWN_ADV_PERIOD_MS
+#define CONFIG_OLG_GATEWAY_COOLDOWN_ADV_PERIOD_MS 600000
+#endif
+#ifndef CONFIG_OLG_GATEWAY_COOLDOWN_ADV_WINDOW_MS
+#define CONFIG_OLG_GATEWAY_COOLDOWN_ADV_WINDOW_MS 3000
 #endif
 #ifndef CONFIG_OLG_GATEWAY_SESSION_TIMEOUT_MS
-#define CONFIG_OLG_GATEWAY_SESSION_TIMEOUT_MS 120000
+#define CONFIG_OLG_GATEWAY_SESSION_TIMEOUT_MS 180000
 #endif
 #ifndef CONFIG_OLG_GATEWAY_RETRY_COUNT
 #define CONFIG_OLG_GATEWAY_RETRY_COUNT 2
@@ -129,8 +156,22 @@ static void finalize_config(void)
 	cfg.gps_min_sats = (uint8_t)clamp_u32(cfg.gps_min_sats, 0U, 32U);
 
 	cfg.gateway_enabled = cfg.gateway_enabled && IS_ENABLED(CONFIG_OLG_GATEWAY_ENABLE);
+	cfg.gateway_upload_acc = cfg.gateway_upload_acc && cfg.acc_enabled;
+	cfg.gateway_upload_gps = cfg.gateway_upload_gps && cfg.gps_enabled;
+	cfg.gateway_upload_ble = cfg.gateway_upload_ble && cfg.ble_enabled;
 	cfg.gateway_period_ms = MAX(cfg.gateway_period_ms, 1U);
 	cfg.gateway_adv_window_ms = MAX(cfg.gateway_adv_window_ms, 1U);
+	cfg.gateway_download_cooldown_ms = MAX(cfg.gateway_download_cooldown_ms, 1U);
+	cfg.gateway_eligible_adv_period_ms = MAX(cfg.gateway_eligible_adv_period_ms, 1U);
+	cfg.gateway_eligible_adv_window_ms =
+		clamp_u32(cfg.gateway_eligible_adv_window_ms, 1U,
+			  cfg.gateway_eligible_adv_period_ms);
+	cfg.gateway_period_ms = cfg.gateway_eligible_adv_period_ms;
+	cfg.gateway_adv_window_ms = cfg.gateway_eligible_adv_window_ms;
+	cfg.gateway_cooldown_adv_period_ms = MAX(cfg.gateway_cooldown_adv_period_ms, 1U);
+	cfg.gateway_cooldown_adv_window_ms =
+		clamp_u32(cfg.gateway_cooldown_adv_window_ms, 1U,
+			  cfg.gateway_cooldown_adv_period_ms);
 	cfg.gateway_session_timeout_ms = MAX(cfg.gateway_session_timeout_ms, 1U);
 	cfg.gateway_retry_min_ms = MAX(cfg.gateway_retry_min_ms, 1U);
 	cfg.gateway_retry_max_ms = MAX(cfg.gateway_retry_max_ms, cfg.gateway_retry_min_ms);
@@ -155,8 +196,17 @@ void olg_config_init_defaults(void)
 	cfg.gps_min_hdop_centi = CONFIG_OLG_GPS_MIN_HDOP_CENTI;
 
 	cfg.gateway_enabled = IS_ENABLED(CONFIG_OLG_GATEWAY_ENABLE);
+	cfg.gateway_upload_acc = IS_ENABLED(CONFIG_OLG_GATEWAY_UPLOAD_ACC);
+	cfg.gateway_upload_gps = IS_ENABLED(CONFIG_OLG_GATEWAY_UPLOAD_GPS);
+	cfg.gateway_upload_ble = IS_ENABLED(CONFIG_OLG_GATEWAY_UPLOAD_BLE);
 	cfg.gateway_period_ms = MAX(CONFIG_OLG_GATEWAY_PERIOD_MS, 1);
 	cfg.gateway_adv_window_ms = MAX(CONFIG_OLG_GATEWAY_ADV_WINDOW_MS, 1);
+	cfg.gateway_download_cooldown_ms = MAX(CONFIG_OLG_GATEWAY_DOWNLOAD_COOLDOWN_MS, 1);
+	cfg.gateway_eligible_adv_period_ms = MAX(CONFIG_OLG_GATEWAY_ELIGIBLE_ADV_PERIOD_MS, 1);
+	cfg.gateway_eligible_adv_window_ms = MAX(CONFIG_OLG_GATEWAY_ELIGIBLE_ADV_WINDOW_MS, 1);
+	cfg.gateway_cooldown_adv_enabled = IS_ENABLED(CONFIG_OLG_GATEWAY_COOLDOWN_ADV_ENABLE);
+	cfg.gateway_cooldown_adv_period_ms = MAX(CONFIG_OLG_GATEWAY_COOLDOWN_ADV_PERIOD_MS, 1);
+	cfg.gateway_cooldown_adv_window_ms = MAX(CONFIG_OLG_GATEWAY_COOLDOWN_ADV_WINDOW_MS, 1);
 	cfg.gateway_session_timeout_ms = MAX(CONFIG_OLG_GATEWAY_SESSION_TIMEOUT_MS, 1);
 	cfg.gateway_retry_count = (uint8_t)MIN(CONFIG_OLG_GATEWAY_RETRY_COUNT, 255);
 	cfg.gateway_retry_min_ms = MAX(CONFIG_OLG_GATEWAY_RETRY_MIN_MS, 1);
@@ -332,10 +382,37 @@ static void apply_key_value(const char *key, const char *value)
 		cfg.gps_min_hdop_centi = (uint16_t)MIN(u, UINT16_MAX);
 	} else if (strcmp(key, "gateway_enabled") == 0 && parse_bool(value, &b)) {
 		cfg.gateway_enabled = b;
+	} else if (strcmp(key, "gateway_upload_acc") == 0 && parse_bool(value, &b)) {
+		cfg.gateway_upload_acc = b;
+	} else if (strcmp(key, "gateway_upload_gps") == 0 && parse_bool(value, &b)) {
+		cfg.gateway_upload_gps = b;
+	} else if (strcmp(key, "gateway_upload_ble") == 0 && parse_bool(value, &b)) {
+		cfg.gateway_upload_ble = b;
 	} else if (strcmp(key, "gateway_period_ms") == 0 && parse_u32(value, &u) && u > 0U) {
 		cfg.gateway_period_ms = u;
+		cfg.gateway_eligible_adv_period_ms = u;
 	} else if (strcmp(key, "gateway_adv_window_ms") == 0 && parse_u32(value, &u) && u > 0U) {
 		cfg.gateway_adv_window_ms = u;
+		cfg.gateway_eligible_adv_window_ms = u;
+	} else if (strcmp(key, "gateway_download_cooldown_ms") == 0 &&
+		   parse_u32(value, &u) && u > 0U) {
+		cfg.gateway_download_cooldown_ms = u;
+	} else if (strcmp(key, "gateway_eligible_adv_period_ms") == 0 &&
+		   parse_u32(value, &u) && u > 0U) {
+		cfg.gateway_eligible_adv_period_ms = u;
+		cfg.gateway_period_ms = u;
+	} else if (strcmp(key, "gateway_eligible_adv_window_ms") == 0 &&
+		   parse_u32(value, &u) && u > 0U) {
+		cfg.gateway_eligible_adv_window_ms = u;
+		cfg.gateway_adv_window_ms = u;
+	} else if (strcmp(key, "gateway_cooldown_adv_enabled") == 0 && parse_bool(value, &b)) {
+		cfg.gateway_cooldown_adv_enabled = b;
+	} else if (strcmp(key, "gateway_cooldown_adv_period_ms") == 0 &&
+		   parse_u32(value, &u) && u > 0U) {
+		cfg.gateway_cooldown_adv_period_ms = u;
+	} else if (strcmp(key, "gateway_cooldown_adv_window_ms") == 0 &&
+		   parse_u32(value, &u) && u > 0U) {
+		cfg.gateway_cooldown_adv_window_ms = u;
 	} else if (strcmp(key, "gateway_session_timeout_ms") == 0 && parse_u32(value, &u) && u > 0U) {
 		cfg.gateway_session_timeout_ms = u;
 	} else if (strcmp(key, "gateway_retry_count") == 0 && parse_u32(value, &u)) {
@@ -379,7 +456,7 @@ static void parse_config_text(char *text)
 
 static int write_config_defaults(struct fs_file_t *file)
 {
-	char buf[640];
+	char buf[1024];
 	char hdop[16];
 	uint16_t hdop_whole = cfg.gps_min_hdop_centi / 100U;
 	uint16_t hdop_frac = cfg.gps_min_hdop_centi % 100U;
@@ -407,8 +484,15 @@ static int write_config_defaults(struct fs_file_t *file)
 			   "gps_min_sats=%u\n"
 			   "gps_min_hdop=%s\n\n"
 			   "gateway_enabled=%s\n"
-			   "gateway_period_ms=%u\n"
-			   "gateway_adv_window_ms=%u\n"
+			   "gateway_upload_acc=%s\n"
+			   "gateway_upload_gps=%s\n"
+			   "gateway_upload_ble=%s\n"
+			   "gateway_download_cooldown_ms=%u\n"
+			   "gateway_eligible_adv_period_ms=%u\n"
+			   "gateway_eligible_adv_window_ms=%u\n"
+			   "gateway_cooldown_adv_enabled=%s\n"
+			   "gateway_cooldown_adv_period_ms=%u\n"
+			   "gateway_cooldown_adv_window_ms=%u\n"
 			   "gateway_session_timeout_ms=%u\n"
 			   "gateway_retry_count=%u\n"
 			   "gateway_retry_min_ms=%u\n"
@@ -429,8 +513,15 @@ static int write_config_defaults(struct fs_file_t *file)
 			   cfg.gps_min_sats,
 			   hdop,
 			   cfg.gateway_enabled ? "true" : "false",
-			   cfg.gateway_period_ms,
-			   cfg.gateway_adv_window_ms,
+			   cfg.gateway_upload_acc ? "true" : "false",
+			   cfg.gateway_upload_gps ? "true" : "false",
+			   cfg.gateway_upload_ble ? "true" : "false",
+			   cfg.gateway_download_cooldown_ms,
+			   cfg.gateway_eligible_adv_period_ms,
+			   cfg.gateway_eligible_adv_window_ms,
+			   cfg.gateway_cooldown_adv_enabled ? "true" : "false",
+			   cfg.gateway_cooldown_adv_period_ms,
+			   cfg.gateway_cooldown_adv_window_ms,
 			   cfg.gateway_session_timeout_ms,
 			   cfg.gateway_retry_count,
 			   cfg.gateway_retry_min_ms,

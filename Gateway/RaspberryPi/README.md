@@ -1,10 +1,20 @@
 # Raspberry Pi Gateway
 
 The gateway is the heavier side of the system. It scans for loggers, connects
-when a logger opens its GATT window, downloads only new binary SD log blocks,
-and stores validated rows in SQLite + Parquet. The gateway-comms testing
-firmware advertises every 2 minutes by default; longer field deployments can
-set `gateway_period_ms=1200000` in `CONFIG.TXT` for a 20-minute interval.
+when a logger opens its GATT window, downloads only the configured record types,
+and stores validated rows in SQLite + Parquet. By default the gateway is a
+lightweight field view: GPS and BLE upload are enabled, raw ACC upload is
+disabled, and the logger SD card remains the full binary archive. The
+logger decides when it is eligible for download. Eligible loggers advertise a
+short status burst every 60 seconds by default; after a successful transfer they
+enter a local cooldown and advertise slowly, or not at all if cooldown
+advertising is disabled in `CONFIG.TXT`.
+
+The gateway reads the logger ID, eligibility, cooldown state, upload mask, and
+compact last-download age from advertisements. It does not connect to every
+visible logger just to decide priority. When several animals are nearby, it
+downloads never-seen loggers first, then loggers with unknown age, then the
+eligible logger with the oldest successful download.
 
 ## Fresh Pi Setup
 
@@ -92,14 +102,14 @@ cd ~/OpenLivestockGateway/Gateway/RaspberryPi
 bash run_gateway.sh
 ```
 
-You should see repeated scanning messages. If no logger is in its gateway window
-yet, this is normal:
+You should see repeated scanning messages. If no transfer-eligible logger is in
+range yet, this is normal:
 
 ```text
 Bluetooth ready. Starting gateway scanner...
 2026-05-17 10:00:00 Gateway running. Data directory: ...
 2026-05-17 10:00:00 Scanning for OpenLivestock loggers for 30 seconds...
-2026-05-17 10:00:30 No logger found. Continuing to scan.
+2026-05-17 10:00:30 No logger status advertisements found. Continuing to scan.
 ```
 
 If the runner says Bluetooth is not powered on, run:
@@ -140,9 +150,12 @@ example:
 http://192.168.4.1:8080
 ```
 
-The dashboard shows gateway heartbeat, logger transfer sessions, downloaded
-row counts, storage space, and a `Download CSV ZIP` button for `ACC.CSV`,
-`GPS.CSV`, and `BLE.CSV`.
+The dashboard shows gateway heartbeat, logger transfer sessions, downloaded row
+counts, storage space, and a date-range export form. Choose logger, dates,
+ACC/GPS/BLE, and CSV ZIP or Parquet ZIP. The dashboard estimates file size
+before preparing the export. Small GPS/BLE daily bundles are fine for a phone;
+large ACC exports should go to a laptop or be copied to a USB SSD plugged into
+the Pi.
 
 Convert a recovered logger SD card to CSV:
 
@@ -158,4 +171,12 @@ Export gateway Parquet data to CSV:
 cd ~/OpenLivestockGateway/Gateway/RaspberryPi
 . .venv/bin/activate
 python olg_log_convert.py parquet-to-csv --input GatewayData/parquet --output exported_csv
+```
+
+Convert a recovered logger SD card to partitioned Parquet:
+
+```bash
+cd ~/OpenLivestockGateway/Gateway/RaspberryPi
+. .venv/bin/activate
+python olg_log_convert.py sd-to-parquet --input /media/pi/LOGGER --output exported_parquet --logger-id LOGGER001
 ```

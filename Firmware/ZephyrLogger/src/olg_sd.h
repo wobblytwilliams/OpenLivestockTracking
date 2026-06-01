@@ -1,5 +1,6 @@
 #pragma once
 
+#include <stdbool.h>
 #include <stdint.h>
 #include <stddef.h>
 
@@ -21,6 +22,9 @@ uint32_t olg_sd_write_fail_count(void);
 uint32_t olg_sd_bad_event_count(void);
 uint32_t olg_sd_written_count(void);
 uint8_t olg_sd_startup_failed(void);
+bool olg_sd_gateway_data_available(void);
+int olg_sd_gateway_state_read(uint8_t *buf, size_t len, size_t *got_out);
+int olg_sd_gateway_state_write(const uint8_t *buf, size_t len);
 
 int olg_sd_gateway_begin(void);
 int olg_sd_gateway_prepare(void);

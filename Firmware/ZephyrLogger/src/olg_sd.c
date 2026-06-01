@@ -32,6 +32,7 @@ static atomic_t startup_failed;
 #define SD_DISK_NAME "SD"
 #define SD_MOUNT_PT  "/" SD_DISK_NAME ":"
 #define SD_LOG_DIR   SD_MOUNT_PT "/LOG"
+#define SD_GATEWAY_STATE_PATH SD_MOUNT_PT "/GATEWAY.BIN"
 
 #define SD_SLOT_NODE DT_ALIAS(olg_sd_slot)
 #define SD_CS_NODE   DT_ALIAS(olg_sd_cs)
@@ -825,6 +826,107 @@ int olg_sd_gateway_begin(void)
 
 	return err;
 #else
+	return -ENOTSUP;
+#endif
+}
+
+bool olg_sd_gateway_data_available(void)
+{
+#if IS_ENABLED(CONFIG_OLG_SD_ENABLE)
+	return active_segment > 0U || active_segment_size > 0U || olg_ring_used() > 0U;
+#else
+	return false;
+#endif
+}
+
+int olg_sd_gateway_state_read(uint8_t *buf, size_t len, size_t *got_out)
+{
+#if IS_ENABLED(CONFIG_OLG_SD_ENABLE)
+	if (buf == NULL || got_out == NULL) {
+		return -EINVAL;
+	}
+
+	*got_out = 0;
+	int err = mount_storage();
+	if (err) {
+		return err;
+	}
+
+	struct fs_file_t file;
+	fs_file_t_init(&file);
+	err = fs_open(&file, SD_GATEWAY_STATE_PATH, FS_O_READ);
+	if (err) {
+		if (!gateway_session) {
+			olg_sd_sleep();
+		}
+		return err;
+	}
+
+	ssize_t got = fs_read(&file, buf, len);
+	int close_err = fs_close(&file);
+	if (!gateway_session) {
+		olg_sd_sleep();
+	}
+	if (got < 0) {
+		return (int)got;
+	}
+	if (close_err) {
+		return close_err;
+	}
+
+	*got_out = (size_t)got;
+	return 0;
+#else
+	ARG_UNUSED(buf);
+	ARG_UNUSED(len);
+	ARG_UNUSED(got_out);
+	return -ENOTSUP;
+#endif
+}
+
+int olg_sd_gateway_state_write(const uint8_t *buf, size_t len)
+{
+#if IS_ENABLED(CONFIG_OLG_SD_ENABLE)
+	if (buf == NULL || len == 0U) {
+		return -EINVAL;
+	}
+
+	int err = mount_storage();
+	if (err) {
+		return err;
+	}
+
+	struct fs_file_t file;
+	fs_file_t_init(&file);
+	err = fs_open(&file, SD_GATEWAY_STATE_PATH, FS_O_WRITE | FS_O_CREATE | FS_O_TRUNC);
+	if (err) {
+		if (!gateway_session) {
+			olg_sd_sleep();
+		}
+		return err;
+	}
+
+	ssize_t written = fs_write(&file, buf, len);
+	if (written == (ssize_t)len) {
+		err = fs_sync(&file);
+	}
+	int close_err = fs_close(&file);
+	if (!gateway_session) {
+		olg_sd_sleep();
+	}
+	if (written < 0) {
+		return (int)written;
+	}
+	if (written != (ssize_t)len) {
+		return -EIO;
+	}
+	if (err) {
+		return err;
+	}
+	return close_err;
+#else
+	ARG_UNUSED(buf);
+	ARG_UNUSED(len);
 	return -ENOTSUP;
 #endif
 }

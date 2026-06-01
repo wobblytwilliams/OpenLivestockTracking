@@ -160,9 +160,16 @@ gps_min_sats=4
 gps_min_hdop=2.5
 
 gateway_enabled=true
-gateway_period_ms=120000
-gateway_adv_window_ms=30000
-gateway_session_timeout_ms=120000
+gateway_upload_acc=false
+gateway_upload_gps=true
+gateway_upload_ble=true
+gateway_download_cooldown_ms=21600000
+gateway_eligible_adv_period_ms=60000
+gateway_eligible_adv_window_ms=5000
+gateway_cooldown_adv_enabled=true
+gateway_cooldown_adv_period_ms=600000
+gateway_cooldown_adv_window_ms=3000
+gateway_session_timeout_ms=180000
 gateway_retry_count=2
 gateway_retry_min_ms=60000
 gateway_retry_max_ms=180000
@@ -180,11 +187,19 @@ The main knobs are:
 - `gps_interval_ms` and `gps_timeout_ms`: how often GPS wakes and how long it
   tries for a usable fix.
 - `gps_min_sats` and `gps_min_hdop`: quality filters for accepting GPS fixes.
-- `gateway_period_ms`: how often the logger briefly advertises for a Raspberry
-  Pi gateway. The gateway-comms testing default is 2 minutes. For longer field
-  deployments, use `1200000` for 20 minutes.
-- `gateway_adv_window_ms`: how long the logger is available for a gateway
-  connection during each period.
+- `gateway_upload_acc`, `gateway_upload_gps`, and `gateway_upload_ble`: which
+  record types the logger sends to the Raspberry Pi gateway. The SD card still
+  keeps the full binary archive. The default is lightweight gateway mode:
+  GPS/BLE upload on, raw ACC upload off.
+- `gateway_download_cooldown_ms`: how long the logger waits after a successful
+  gateway download before allowing another full transfer. The default is 6
+  hours.
+- `gateway_eligible_adv_period_ms` and `gateway_eligible_adv_window_ms`: how
+  often a transfer-eligible logger advertises, and how long each connection
+  window stays open. The default is a 5-second burst every 60 seconds.
+- `gateway_cooldown_adv_enabled`, `gateway_cooldown_adv_period_ms`, and
+  `gateway_cooldown_adv_window_ms`: optional slower "present but not ready"
+  advertising while the logger is inside its download cooldown.
 
 Invalid or missing values fall back to compiled defaults, so a typo should not
 stop the logger from starting.
@@ -240,11 +255,14 @@ Then this computer can connect with:
 ssh thom@open-livestock-gateway.local
 ```
 
-The Pi scans continuously. The logger only advertises briefly every 2 minutes in
-this gateway-comms test build, so the power cost mostly sits on the Pi. For
-longer field deployments, change `gateway_period_ms` back to `1200000` in
-`CONFIG.TXT`. The gateway stores transfer state in SQLite and validated rows in
-Parquet.
+The Pi scans continuously. The logger advertises short status bursts: eligible
+loggers default to a 5-second burst every 60 seconds, while loggers inside their
+download cooldown advertise more slowly or can be set not to advertise at all.
+The gateway stores transfer state in SQLite and validated rows in Parquet.
+Each advertisement includes the logger ID, transfer eligibility, cooldown state,
+upload mask, and compact last-download age. If many animals are at a gateway at
+once, the Pi services loggers that have never downloaded first, then unknown-age
+loggers, then the logger with the oldest successful download.
 
 Start the downloader in one SSH tab:
 
@@ -260,7 +278,7 @@ yet, this is normal:
 Bluetooth ready. Starting gateway scanner...
 2026-05-17 10:00:00 Gateway running. Data directory: ...
 2026-05-17 10:00:00 Scanning for OpenLivestock loggers for 30 seconds...
-2026-05-17 10:00:30 No logger found. Continuing to scan.
+2026-05-17 10:00:30 No logger status advertisements found. Continuing to scan.
 ```
 
 If it reports that Bluetooth is not powered on, run:
@@ -323,7 +341,15 @@ http://192.168.4.1:8080
 ```
 
 The dashboard shows gateway heartbeat, recent transfer sessions, logger status,
-row counts, storage space, and a `Download CSV ZIP` button.
+row counts, storage space, and a date-range export form. Choose one logger or
+all loggers, a start and end date, ACC/GPS/BLE, and CSV ZIP or Parquet ZIP. The
+dashboard estimates the selected number of days and the likely CSV/Parquet file
+size before you prepare the export.
+
+Small daily GPS/BLE bundles are suitable for a phone. Large ACC exports should
+be prepared on the Pi and downloaded to a laptop or copied to a USB SSD from the
+dashboard. Do not plan on moving hundreds of GB over phone Wi-Fi at the end of a
+deployment.
 
 To export the gateway store back to CSV from the command line:
 
@@ -331,6 +357,13 @@ To export the gateway store back to CSV from the command line:
 cd ~/OpenLivestockGateway/Gateway/RaspberryPi
 . .venv/bin/activate
 python olg_log_convert.py parquet-to-csv --input GatewayData/parquet --output exported_csv
+```
+
+To convert a recovered logger SD card into the same partitioned Parquet layout
+used by the gateway:
+
+```bash
+python olg_log_convert.py sd-to-parquet --input /path/to/SD --output exported_parquet --logger-id LOGGER001
 ```
 
 ## Choosing A Firmware
@@ -359,5 +392,8 @@ Thomas Williams is acknowledged. See [LICENSE](LICENSE).
 5. Reboot the logger with the SD card installed.
 6. Confirm the status LED is not solid on.
 7. Deploy the logger.
-8. After recovery, convert the SD `LOG/OLG*.BIN` files to `ACC.CSV`, `GPS.CSV`,
-   and `BLE.CSV`, or export the Raspberry Pi gateway Parquet store to CSV.
+8. During deployment, use the gateway dashboard for small date-range GPS/BLE
+   exports and diagnostics.
+9. After recovery, copy the SD `LOG/OLG*.BIN` files and convert them to CSV or
+   Parquet. If the gateway captured a large archive, plug a USB SSD into the Pi
+   and use the dashboard's prepared export copy workflow.

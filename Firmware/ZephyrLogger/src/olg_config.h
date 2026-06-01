@@ -21,8 +21,17 @@ struct olg_config {
 	uint16_t gps_min_hdop_centi;
 
 	bool gateway_enabled;
+	bool gateway_upload_acc;
+	bool gateway_upload_gps;
+	bool gateway_upload_ble;
 	uint32_t gateway_period_ms;
 	uint32_t gateway_adv_window_ms;
+	uint32_t gateway_download_cooldown_ms;
+	uint32_t gateway_eligible_adv_period_ms;
+	uint32_t gateway_eligible_adv_window_ms;
+	bool gateway_cooldown_adv_enabled;
+	uint32_t gateway_cooldown_adv_period_ms;
+	uint32_t gateway_cooldown_adv_window_ms;
 	uint32_t gateway_session_timeout_ms;
 	uint8_t gateway_retry_count;
 	uint32_t gateway_retry_min_ms;
